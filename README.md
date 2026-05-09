@@ -30,7 +30,7 @@ TurboQuant (WHT-based scalar quantization) originates from [TheTom/llama-cpp-tur
 
 Here's your typical "write in Python" best-case ceiling benchmark with [Qwen 3.6 27B](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) using [Q4_K_M drafter](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF) on a single RTX 3090 24GB. Like any other speculative prediction, DFlash is strongest on structured, repetitive generation: code, tests, boilerplate, JSON-like formats, and other low-entropy continuations.
 
-| Task | Model | Output | Baseline | Bee DFlash | Peak speedup | Acceptance |
+| Task | Model | Output | Baseline | Bee DFlash | Speedup | Acceptance |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | Linked list | Q4_K_M | ~1.2K tok | 39.2 tok/s | **130.1 tok/s** | **3.32x** | 49.1% / 84.5% |
 | Linked list | Q5_K_S | ~1.2K tok | 36.5 tok/s | **135.8 tok/s** | **3.72x** | 47.8% / 85.8% |
