@@ -13,6 +13,10 @@
 
 using json = nlohmann::ordered_json;
 
+static bool is_structural_tool_marker(const std::string & marker) {
+    return !marker.empty() && (marker[0] == '<' || marker[0] == '[');
+}
+
 // Helper to iterate over tools/functions
 static void foreach_function(const json & tools, const std::function<void(const json &)> & fn) {
     for (const auto & tool : tools) {
@@ -76,11 +80,30 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
-        // Set grammar triggers based on tool section markers (fall back to per-call markers)
+        // Set grammar triggers based on tool section markers (fall back to per-call markers).
+        // Some tag-style models occasionally skip the outer per-call wrapper and start
+        // directly at the function marker; trigger there too if it is a structural marker.
         if (data.grammar_lazy) {
-            data.grammar_triggers = {
-                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, trigger_marker }
+            std::vector<std::string> trigger_markers = {
+                autoparser.tools.format.section_start,
+                autoparser.tools.format.per_call_start,
             };
+            if (is_structural_tool_marker(autoparser.tools.function.name_prefix)) {
+                trigger_markers.push_back(autoparser.tools.function.name_prefix);
+            }
+
+            for (const std::string & marker : trigger_markers) {
+                if (marker.empty()) {
+                    continue;
+                }
+                bool exists = false;
+                for (const auto & trigger : data.grammar_triggers) {
+                    exists = exists || trigger.value == marker;
+                }
+                if (!exists) {
+                    data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, marker });
+                }
+            }
         }
     }
 
@@ -440,12 +463,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     common_peg_parser tool_calls = p.eps();
 
+    const bool allow_direct_func_start =
+        is_structural_tool_marker(function.name_prefix) && !function.close.empty();
+
     if (!format.per_call_start.empty()) {
         auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
+        auto single_call  = allow_direct_func_start ? (wrapped_call | tool_choice) : wrapped_call;
         if (inputs.parallel_tool_calls) {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
+            tool_calls = p.trigger_rule("tool-call", single_call + p.zero_or_more(p.space() + single_call) + p.space());
         } else {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
+            tool_calls = p.trigger_rule("tool-call", single_call + p.space());
         }
         if (!format.section_start.empty()) {
             tool_calls = p.trigger_rule("tool-calls",
@@ -469,8 +496,17 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         tool_calls = p.optional(tool_calls);
     }
 
-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+    std::vector<std::string> trigger_markers;
+    if (!format.section_start.empty()) {
+        trigger_markers.push_back(format.section_start);
+    }
+    if (!format.per_call_start.empty()) {
+        trigger_markers.push_back(format.per_call_start);
+    }
+    if (allow_direct_func_start) {
+        trigger_markers.push_back(function.name_prefix);
+    }
+    auto content_before_tools = trigger_markers.empty() ? p.eps() : p.until_one_of(trigger_markers);
     return ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(content_before_tools))) + tool_calls +
            p.end();
 }

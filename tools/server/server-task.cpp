@@ -244,6 +244,252 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
+static bool task_result_has_explicit_tool_call_marker(const std::string & text);
+
+static bool task_result_has_complete_partial_tool_calls(
+        const std::string     & generated_text,
+        const common_chat_msg & msg) {
+    if (msg.tool_calls.empty()) {
+        return false;
+    }
+
+    for (const auto & tc : msg.tool_calls) {
+        if (tc.name.empty() || tc.arguments.empty()) {
+            return false;
+        }
+    }
+
+    const size_t end = generated_text.find_last_not_of(" \t\r\n");
+    if (end == std::string::npos) {
+        return false;
+    }
+
+    const size_t start = end > 512 ? end - 512 : 0;
+    const std::string tail = generated_text.substr(start, end - start + 1);
+
+    static const char * closing_markers[] = {
+        "</tool_call>",
+        "</function>",
+        "</seed:tool_call>",
+        "</minimax:tool_call>",
+        "</TOOLCALL>",
+        "<|tool_call_end|>",
+        "<|tool_calls_section_end|>",
+        "<tool_call|>",
+    };
+    for (const char * marker : closing_markers) {
+        if (tail.find(marker) != std::string::npos) {
+            return true;
+        }
+    }
+
+    // Check full generated_text, not only tail. A long argument can push the
+    // opening marker outside the 512-byte tail window. In tagged formats,
+    // JSON/object closure alone is not completion.
+    if (task_result_has_explicit_tool_call_marker(generated_text)) {
+        return false;
+    }
+
+    const char last = generated_text[end];
+    return last == '}' || last == ']' || last == ')';
+}
+
+static bool task_result_pos_is_in_code_fence(
+        const std::string & text,
+        size_t              pos) {
+    bool in_fence = false;
+    size_t search = 0;
+    while (search < pos) {
+        const size_t fence = text.find("```", search);
+        if (fence == std::string::npos || fence >= pos) {
+            break;
+        }
+        in_fence = !in_fence;
+        search = fence + 3;
+    }
+    return in_fence;
+}
+
+static bool task_result_raw_tool_marker_has_boundary(
+        const std::string & text,
+        size_t              pos) {
+    if (pos == 0) {
+        return true;
+    }
+
+    const char prev = text[pos - 1];
+    return prev == '\n' || prev == '\r' || prev == '\t' || prev == ' ' || prev == '>';
+}
+
+static size_t task_result_find_raw_tool_marker(
+        const std::string & text,
+        size_t              search_from) {
+    static const char * markers[] = {
+        "<tool_call",
+        "<function=",
+        "<parameter=",
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>",
+        "<|tool_call_start|>",
+        "<seed:tool_call",
+        "<minimax:tool_call",
+        "<TOOLCALL",
+    };
+
+    size_t best = std::string::npos;
+    for (const char * marker : markers) {
+        size_t pos = text.find(marker, search_from);
+        while (pos != std::string::npos) {
+            if (task_result_raw_tool_marker_has_boundary(text, pos) &&
+                    !task_result_pos_is_in_code_fence(text, pos)) {
+                best = best == std::string::npos ? pos : std::min(best, pos);
+                break;
+            }
+            pos = text.find(marker, pos + 1);
+        }
+    }
+
+    return best;
+}
+
+static bool task_result_has_explicit_tool_call_marker(const std::string & text) {
+    return task_result_find_raw_tool_marker(text, 0) != std::string::npos;
+}
+
+static bool task_result_starts_with_raw_tool_marker(const std::string & text) {
+    const size_t marker = task_result_find_raw_tool_marker(text, 0);
+    if (marker == std::string::npos) {
+        return false;
+    }
+
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    return first != std::string::npos && marker == first;
+}
+
+static void task_result_quarantine_raw_tool_text_field(
+        std::string       & text,
+        const std::string & previous) {
+    if (text.size() <= previous.size()) {
+        return;
+    }
+
+    const size_t search_from = previous.size() > 64 ? previous.size() - 64 : 0;
+    const size_t marker = task_result_find_raw_tool_marker(text, search_from);
+    if (marker == std::string::npos) {
+        return;
+    }
+
+    // Keep all text that was already streamed. If a malformed raw tool marker
+    // appears in newly parsed content/reasoning, quarantine it until it becomes
+    // a parsed tool call instead of visible assistant text.
+    if (marker < previous.size()) {
+        text = previous;
+    } else {
+        text.resize(marker);
+    }
+}
+
+static void task_result_quarantine_raw_tool_text(
+        common_chat_msg       & new_msg,
+        const common_chat_msg & msg_prv) {
+    if (new_msg.tool_calls.size() > msg_prv.tool_calls.size()) {
+        return;
+    }
+
+    task_result_quarantine_raw_tool_text_field(new_msg.content, msg_prv.content);
+    task_result_quarantine_raw_tool_text_field(new_msg.reasoning_content, msg_prv.reasoning_content);
+}
+
+static void task_result_freeze_text_fields(
+        common_chat_msg       & new_msg,
+        const common_chat_msg & msg_prv) {
+    new_msg.content = msg_prv.content;
+    new_msg.content_parts = msg_prv.content_parts;
+    new_msg.reasoning_content = msg_prv.reasoning_content;
+}
+
+static bool task_result_has_marker_after_anchor(
+        const std::string & generated_text,
+        const std::string & anchor) {
+    if (anchor.empty()) {
+        return false;
+    }
+
+    const size_t pos = generated_text.rfind(anchor);
+    if (pos == std::string::npos) {
+        return false;
+    }
+
+    const size_t tail_len = std::min<size_t>(generated_text.size() - pos, 512);
+    const std::string tail = generated_text.substr(pos, tail_len);
+
+    static const char * argument_markers[] = {
+        "<|tool_call_argument_begin|>",
+        "<parameter=",
+        "\"arguments\"",
+        "'arguments'",
+        "arguments:",
+        "arguments=",
+    };
+    for (const char * marker : argument_markers) {
+        if (tail.find(marker) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool task_result_has_stable_partial_tool_call_header(
+        const std::string           & generated_text,
+        const common_chat_tool_call & tc) {
+    if (tc.name.empty()) {
+        return false;
+    }
+
+    // Arguments present in the parsed result does not guarantee a stable header
+    // for streaming purposes. The parser may have only started argument parsing
+    // (e.g. just "{"). Only consider the header stable when the generated text
+    // has argument markers after the tool call name/id anchor.
+    return task_result_has_marker_after_anchor(generated_text, tc.id) ||
+           task_result_has_marker_after_anchor(generated_text, tc.name);
+}
+
+static void task_result_filter_incomplete_partial_tool_calls(
+        const std::string     & generated_text,
+        common_chat_msg       & new_msg,
+        const common_chat_msg & msg_prv) {
+    std::vector<common_chat_tool_call> filtered;
+    filtered.reserve(std::max(new_msg.tool_calls.size(), msg_prv.tool_calls.size()));
+
+    for (size_t i = 0; i < new_msg.tool_calls.size(); ++i) {
+        common_chat_tool_call tc = new_msg.tool_calls[i];
+        if (i < msg_prv.tool_calls.size()) {
+            if (tc.name.empty()) {
+                tc.name = msg_prv.tool_calls[i].name;
+            }
+            if (tc.id.empty()) {
+                tc.id = msg_prv.tool_calls[i].id;
+            }
+        }
+
+        if (!task_result_has_stable_partial_tool_call_header(generated_text, tc)) {
+            break;
+        }
+
+        // A partial stream may expose the stable tool name/id for UX, but the
+        // arguments remain hidden until a complete call is parsed.
+        tc.arguments = i < msg_prv.tool_calls.size() ? msg_prv.tool_calls[i].arguments : "";
+        filtered.push_back(std::move(tc));
+    }
+
+    while (filtered.size() < msg_prv.tool_calls.size()) {
+        filtered.push_back(msg_prv.tool_calls[filtered.size()]);
+    }
+
+    new_msg.tool_calls = std::move(filtered);
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
@@ -258,6 +504,19 @@ common_chat_msg task_result_state::update_chat_msg(
         chat_parser_params);
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        if (filter_tool_calls && chat_parser_params.parse_tool_calls) {
+            const bool has_complete_tool_calls = task_result_has_complete_partial_tool_calls(generated_text, new_msg);
+            if (!new_msg.tool_calls.empty() &&
+                    (!has_complete_tool_calls || task_result_starts_with_raw_tool_marker(generated_text))) {
+                task_result_freeze_text_fields(new_msg, msg_prv_copy);
+            }
+            if (!has_complete_tool_calls) {
+                task_result_quarantine_raw_tool_text(new_msg, msg_prv_copy);
+            }
+            if (!has_complete_tool_calls) {
+                task_result_filter_incomplete_partial_tool_calls(generated_text, new_msg, msg_prv_copy);
+            }
+        }
         chat_msg = new_msg;
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
 
@@ -292,7 +551,7 @@ common_chat_msg task_result_state::update_chat_msg(
                         }
                     } else {
                         // Not sent yet.
-                        if (!d.tool_call_delta.arguments.empty() || !is_partial) {
+                        if (!d.tool_call_delta.name.empty() || !d.tool_call_delta.arguments.empty() || !is_partial) {
                             d.tool_call_delta.name = chat_msg.tool_calls[i].name;
                             d.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                             diffs.push_back(std::move(d));
@@ -1525,7 +1784,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 //
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
-    state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    state.update_chat_msg(content, true, oaicompat_msg_diffs, true);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;
