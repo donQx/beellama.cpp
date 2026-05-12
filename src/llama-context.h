@@ -143,6 +143,7 @@ struct dflash_capture_data {
     // Opt-in DFlash profiling (GGML_DFLASH_PROFILE=1).
     bool profile = false;
     bool multi_gpu_capture_fallback_logged = false;
+    bool multi_gpu_replay_fallback_logged = false;
     uint64_t profile_decode_us = 0;
     uint64_t profile_raw_logits_us = 0;
     uint64_t profile_raw_logits_bytes = 0;

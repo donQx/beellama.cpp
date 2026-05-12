@@ -77,7 +77,7 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("tl.qkv  = ggml_new_tensor_2d") != std::string::npos, "GPU tape allocator must allocate QKV tensor");
     ok &= expect(context_cpp.find("n_accepted <= gpu_tape->n_tokens") != std::string::npos, "GPU tape replay must require populated token count");
     ok &= expect(context_cpp.find("std::max((int) layer_hiddens.size(), (int) dflash_capture->tapes.size())") != std::string::npos, "active DFlash slot must work without GPU tape");
-    ok &= expect(context_cpp.find("ggml_backend_tensor_get_async(gpu_backend, gpu_layer->qkv") != std::string::npos, "conv rebuild must read QKV from GPU tape");
+    ok &= expect(context_cpp.find("get_tensor_data(gpu_layer->qkv") != std::string::npos, "conv rebuild must read QKV from GPU tape through placement-safe tensor access");
     ok &= expect(graph_cpp.find("t_logits_argmax = nullptr;") != std::string::npos, "graph reset must clear reduced logits output pointer");
     ok &= expect(context_cpp.find("logits_argmax_buf.clear();") != std::string::npos, "decode must clear stale reduced logits ids");
     ok &= expect(context_cpp.find("logits_argmax_prob_buf.clear();") != std::string::npos, "decode must clear stale reduced logits probabilities");
@@ -144,6 +144,7 @@ int main(int argc, char ** argv) {
     ok &= expect(context_h.find("struct dflash_hidden_gpu") != std::string::npos, "DFlash must define GPU hidden capture storage");
     ok &= expect(cparams_h.find("hidden_gpu_seqs") != std::string::npos, "graph params must expose per-seq GPU hidden targets");
     ok &= expect(context_h.find("bool gpu_capture_enabled = true") != std::string::npos, "DFlash capture must be able to force CPU hidden callbacks");
+    ok &= expect(context_h.find("multi_gpu_replay_fallback_logged") != std::string::npos, "DFlash capture must log multi-GPU recurrent replay fallback once");
     ok &= expect(llama_h.find("llama_set_dflash_gpu_capture") != std::string::npos, "public DFlash API must expose GPU capture gating");
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback");
@@ -152,6 +153,10 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
     ok &= expect(context_cpp.find("multi-GPU target detected") != std::string::npos, "multi-GPU target must fall back from graph-embedded DFlash GPU capture");
     ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement and explicit GPU capture policy");
+    ok &= expect(context_cpp.find("const bool multi_gpu_target = model.n_devices() > 1;") != std::string::npos, "DFlash replay must detect multi-GPU target placement before choosing GPU replay");
+    ok &= expect(context_cpp.find("using CPU DFlash recurrent replay") != std::string::npos, "DFlash replay must log the multi-GPU CPU replay fallback");
+    ok &= expect(context_cpp.find("tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);\n        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);") != std::string::npos,
+        "DFlash multi-GPU replay fallback must update both S-state and conv state");
     ok &= expect(speculative.find("common_dflash_gpu_ring_allowed") != std::string::npos, "DFlash GPU cross ring must have an explicit multi-GPU policy");
     ok &= expect(speculative.find("llama_model_n_devices(llama_get_model(ctx_tgt))") != std::string::npos, "DFlash GPU cross ring policy must check target placement");
     ok &= expect(speculative.find("llama_model_n_devices(llama_get_model(ctx_dft))") != std::string::npos, "DFlash GPU cross ring policy must check drafter placement");
@@ -196,13 +201,19 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_cpp.find("source buffer is not visible to CUDA backend device") != std::string::npos,
         "CUDA backend assert diagnostics must report the non-local source tensor");
     ok &= expect(context_h.find("tape_replay_conv_gpu") != std::string::npos, "DFlash must declare GPU conv rebuild fast path");
-    ok &= expect(context_cpp.find("tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "conv replay must try GPU rebuild before CPU fallback");
+    ok &= expect(context_cpp.find("model.n_devices() <= 1 && tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "conv replay must try GPU rebuild only for single-GPU target placement");
+    ok &= expect(context_cpp.find("const bool use_async_backend = gpu_backend && model.n_devices() <= 1;") != std::string::npos, "conv replay CPU fallback must use async backend copies only for single-GPU target placement");
+    ok &= expect(context_cpp.find("ggml_backend_tensor_get_async(gpu_backend, r_tensor") == std::string::npos, "conv replay must not read split recurrent state through the first GPU backend");
+    ok &= expect(context_cpp.find("ggml_backend_tensor_set_async(gpu_backend, d.r_tensor") == std::string::npos, "conv replay must not write split recurrent state through the first GPU backend");
     ok &= expect(context_cpp.find("conv_gpu_enqueue=%.3f ms") != std::string::npos, "DFlash profile must report GPU conv enqueue time");
     ok &= expect(cuda_ring.find("k_dflash_rebuild_conv_state") != std::string::npos, "CUDA ring source must provide conv rebuild kernel");
     ok &= expect(cuda_reg.find("\"dflash_rebuild_conv_state\"") != std::string::npos, "CUDA backend registry must publish conv rebuild kernel");
     ok &= expect(context_h.find("replay_direct_gpu") != std::string::npos, "DFlash capture state must track direct GPU replay");
     ok &= expect(context_h.find("tape_replay_gdn_direct_gpu") != std::string::npos, "DFlash must declare direct GPU GDN replay fast path");
     ok &= expect(context_cpp.find("tape_replay_gdn_direct_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "tape replay must try direct GPU GDN replay before ggml graph replay");
+    ok &= expect(context_cpp.find("if (model.n_devices() > 1) {\n        return false;\n    }") != std::string::npos, "direct DFlash GPU replay helpers must reject multi-GPU target placement");
+    ok &= expect(context_cpp.find("const ggml_status replay_status = ggml_backend_graph_compute_async(gpu_backend, graph);") != std::string::npos, "DFlash GPU replay graph launch status must be checked");
+    ok &= expect(context_cpp.find("GPU DFlash recurrent replay graph failed") != std::string::npos, "DFlash GPU replay graph failure must fall back instead of leaving pending replay state");
     ok &= expect(context_cpp.find("dflash_replay_gdn_state_no_check") != std::string::npos, "DFlash direct replay must call CUDA GDN replay helper");
     ok &= expect(context_cpp.find("tl.gate->ne[0] != 1 || tl.beta->ne[0] != 1") != std::string::npos, "direct GDN replay must reject KDA gate/beta layouts");
     ok &= expect(context_cpp.find("DFlash direct GPU GDN replay launch failed after validation") != std::string::npos, "direct GDN replay must not fall back after partial GPU state mutation");
@@ -218,6 +229,10 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("seq_cp_recurrent_no_sync(seq_backup, seq_id") != std::string::npos, "DFlash rollback must avoid synchronous recurrent restore before replay");
     ok &= expect(context_cpp.find("recurrent_restore=%.3f ms") != std::string::npos, "DFlash rollback profiling must expose recurrent restore cost");
     ok &= expect(cuda_cpp.find("ggml_cuda_buffer_visible_to_backend(ggml_backend_cuda_context * cuda_ctx") != std::string::npos, "CUDA backend must centralize backend buffer visibility checks");
+    ok &= expect(cuda_cpp.find("ggml_backend_cuda_buffer_matches_backend") != std::string::npos, "CUDA async tensor access must share backend/buffer ownership checks");
+    ok &= expect(cuda_cpp.find("ggml_backend_tensor_get(tensor, data, offset, size);") != std::string::npos, "CUDA async tensor reads must fall back to the tensor's owning buffer instead of asserting on wrong-device buffers");
+    ok &= expect(cuda_cpp.find("ggml_backend_tensor_set(tensor, data, offset, size);") != std::string::npos, "CUDA async tensor writes must fall back to the tensor's owning buffer instead of asserting on wrong-device buffers");
+    ok &= expect(cuda_cpp.find("unsupported buffer type") == std::string::npos, "CUDA backend must not assert on wrong-device async tensor access");
     ok &= expect(cuda_cpp.find("ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_ctx") != std::string::npos, "CUDA graph compatibility must know the active CUDA backend");
     ok &= expect(cuda_cpp.find("for (int j = 0; j < GGML_MAX_SRC; ++j)") != std::string::npos, "CUDA graph compatibility must inspect every source buffer");
     ok &= expect(cuda_cpp.find("ggml_cuda_log_nonlocal_src_buffer") != std::string::npos, "CUDA backend must log non-local source tensor details");

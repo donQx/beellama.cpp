@@ -1863,6 +1863,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     if (!gpu_backend) {
         tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
         return;
     }
 
@@ -1872,8 +1873,21 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         ggml_tensor * s_tensor = mem_recurrent->s_l[rec_ids[li]];
         if (s_tensor && s_tensor->buffer && ggml_backend_buffer_is_host(s_tensor->buffer)) {
             tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
             return;
         }
+    }
+
+    const bool multi_gpu_target = model.n_devices() > 1;
+    if (multi_gpu_target) {
+        if (!dflash_capture->multi_gpu_replay_fallback_logged) {
+            LLAMA_LOG_INFO("%s: multi-GPU target detected (%zu devices); using CPU DFlash recurrent replay\n",
+                    __func__, model.n_devices());
+            dflash_capture->multi_gpu_replay_fallback_logged = true;
+        }
+        tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+        return;
     }
 
     if (use_gpu_tape && tape_replay_gdn_direct_gpu(mem_recurrent, cell_idx, n_accepted)) {
@@ -2007,6 +2021,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             LLAMA_LOG_WARN("%s: failed to allocate GPU buffer for tape replay, falling back to CPU\n", __func__);
             ggml_free(ctx);
             tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
             return;
         }
 
@@ -2052,7 +2067,18 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         }
 
         // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
-        ggml_backend_graph_compute_async(gpu_backend, graph);
+        const ggml_status replay_status = ggml_backend_graph_compute_async(gpu_backend, graph);
+        if (replay_status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_WARN("%s: GPU DFlash recurrent replay graph failed with status %d; %s\n",
+                    __func__, (int) replay_status,
+                    use_gpu_tape ? "CPU fallback unavailable for GPU tape" : "falling back to CPU");
+            ggml_free(ctx);
+            if (!use_gpu_tape) {
+                tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+                tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+            }
+            return;
+        }
 
         // save deferred state for async completion
         dflash_capture->replay_pending = true;
@@ -2071,6 +2097,9 @@ conv_rebuild:
 
 bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
     if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
+        return false;
+    }
+    if (model.n_devices() > 1) {
         return false;
     }
 
@@ -2181,6 +2210,9 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
     if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
         return false;
     }
+    if (model.n_devices() > 1) {
+        return false;
+    }
 
     ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
     if (!cuda_reg) {
@@ -2266,7 +2298,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_r = hparams.n_embd_r();
 
-    if (tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
+    if (model.n_devices() <= 1 && tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
         return;
     }
 
@@ -2294,6 +2326,21 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
             break;
         }
     }
+    const bool use_async_backend = gpu_backend && model.n_devices() <= 1;
+    auto get_tensor_data = [&](const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+        if (use_async_backend) {
+            ggml_backend_tensor_get_async(gpu_backend, tensor, data, offset, size);
+        } else {
+            ggml_backend_tensor_get(tensor, data, offset, size);
+        }
+    };
+    auto set_tensor_data = [&](ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+        if (use_async_backend) {
+            ggml_backend_tensor_set_async(gpu_backend, tensor, data, offset, size);
+        } else {
+            ggml_backend_tensor_set(tensor, data, offset, size);
+        }
+    };
 
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
@@ -2339,13 +2386,9 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
         d.qkv_mixed.resize((size_t) n_accepted * (size_t) conv_ch);
         d.new_conv.resize(n_embd_r);
 
-        if (gpu_backend) {
-            ggml_backend_tensor_get_async(gpu_backend, r_tensor, d.old_window.data(), r_offset, n_embd_r * sizeof(float));
-        } else {
-            ggml_backend_tensor_get(r_tensor, d.old_window.data(), r_offset, n_embd_r * sizeof(float));
-        }
+        get_tensor_data(r_tensor, d.old_window.data(), r_offset, n_embd_r * sizeof(float));
         if (use_gpu_qkv) {
-            ggml_backend_tensor_get_async(gpu_backend, gpu_layer->qkv, d.qkv_mixed.data(), 0, d.qkv_mixed.size() * sizeof(float));
+            get_tensor_data(gpu_layer->qkv, d.qkv_mixed.data(), 0, d.qkv_mixed.size() * sizeof(float));
         } else {
             std::memcpy(d.qkv_mixed.data(),
                         tape.qkv_mixed.data() + qkv_seq_offset,
@@ -2354,7 +2397,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     }
 
     // Phase 2: single sync point for all reads
-    if (gpu_backend && !layers.empty()) {
+    if (use_async_backend && !layers.empty()) {
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_synchronize(gpu_backend);
         if (dflash_capture->profile) {
@@ -2384,13 +2427,9 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
 
     // Phase 4: issue all async writes to GPU, then single sync
     for (auto & d : layers) {
-        if (gpu_backend) {
-            ggml_backend_tensor_set_async(gpu_backend, d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
-        } else {
-            ggml_backend_tensor_set(d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
-        }
+        set_tensor_data(d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
     }
-    if (gpu_backend && !layers.empty()) {
+    if (use_async_backend && !layers.empty()) {
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_synchronize(gpu_backend);
         if (dflash_capture->profile) {
@@ -3215,6 +3254,21 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
             break;
         }
     }
+    const bool use_async_backend = gpu_backend && model.n_devices() <= 1;
+    auto get_tensor_data = [&](const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+        if (use_async_backend) {
+            ggml_backend_tensor_get_async(gpu_backend, tensor, data, offset, size);
+        } else {
+            ggml_backend_tensor_get(tensor, data, offset, size);
+        }
+    };
+    auto set_tensor_data = [&](ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+        if (use_async_backend) {
+            ggml_backend_tensor_set_async(gpu_backend, tensor, data, offset, size);
+        } else {
+            ggml_backend_tensor_set(tensor, data, offset, size);
+        }
+    };
 
     // Count recurrent layers
     int n_rec = 0;
@@ -3345,13 +3399,9 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
             }
             d.read_offset = read_offset;
 
-            if (gpu_backend) {
-                ggml_backend_tensor_get_async(gpu_backend, r_tensor, d.old_window.data(), read_offset, n_embd_r * sizeof(float));
-            } else {
-                ggml_backend_tensor_get(r_tensor, d.old_window.data(), read_offset, n_embd_r * sizeof(float));
-            }
+            get_tensor_data(r_tensor, d.old_window.data(), read_offset, n_embd_r * sizeof(float));
             if (use_gpu_qkv) {
-                ggml_backend_tensor_get_async(gpu_backend, gpu_layer->qkv, d.qkv_mixed.data(), 0, d.qkv_mixed.size() * sizeof(float));
+                get_tensor_data(gpu_layer->qkv, d.qkv_mixed.data(), 0, d.qkv_mixed.size() * sizeof(float));
             } else {
                 std::memcpy(d.qkv_mixed.data(),
                             tape.qkv_mixed.data(),
@@ -3360,7 +3410,7 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
         }
 
         // Single sync for all reads
-        if (gpu_backend && !conv_layers.empty()) {
+        if (use_async_backend && !conv_layers.empty()) {
             ggml_backend_synchronize(gpu_backend);
         }
 
@@ -3382,13 +3432,9 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
 
         // Async write all results back
         for (auto & d : conv_layers) {
-            if (gpu_backend) {
-                ggml_backend_tensor_set_async(gpu_backend, d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
-            } else {
-                ggml_backend_tensor_set(d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
-            }
+            set_tensor_data(d.r_tensor, d.new_conv.data(), d.r_offset, n_embd_r * sizeof(float));
         }
-        if (gpu_backend && !conv_layers.empty()) {
+        if (use_async_backend && !conv_layers.empty()) {
             ggml_backend_synchronize(gpu_backend);
         }
     }
