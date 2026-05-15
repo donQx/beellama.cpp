@@ -1,5 +1,8 @@
 #include "models.h"
 #include "ggml.h"
+#include "llama-context.h"
+
+#include <algorithm>
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
 static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
@@ -31,6 +34,9 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -239,6 +245,28 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (cparams.hidden_gpu_n_seqs > 0 && cur->ne[1] == n_seq_tokens * n_seqs) {
+            for (int s = 0; s < (int) n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
+                auto * hgpu = cparams.hidden_gpu_seqs[s];
+                if (!hgpu) continue;
+
+                int hi = -1;
+                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
+                    if (hgpu->layer_ids[i] == il) { hi = i; break; }
+                }
+                if (hi < 0 || n_seq_tokens > hgpu->max_tokens) continue;
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], n_seq_tokens,
+                    cur->nb[1], (size_t) s * (size_t) n_seq_tokens * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
+                    hgpu->layers[hi]->ne[0], (int64_t) n_seq_tokens,
+                    hgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
         // input for next layer
         inpL = cur;
     }
@@ -262,6 +290,16 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (cparams.dflash_verify_logits) {
+        const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);
+        }
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -314,9 +352,13 @@ ggml_tensor * llm_build_gemma4_iswa::project_per_layer_inputs(ggml_tensor * inp_
     const float per_layer_projection_scale = 1.0f / sqrtf((float) n_embd);
     const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
-    // note: this matrix multiplication will be performed in the input layer (i.e. on the CPU)
+    // note: per_layer_model_proj is classified as LLM_TENSOR_LAYER_REPEATING with
+    // GGML_OP_MUL_MAT and bid=0, so it routes through the layer buffer list (GPU under
+    // -ngl all). Exact backend placement can still be affected by buffer support and
+    // overrides, so this callback helps measure the matmul independently.
     ggml_tensor * per_layer_proj;
     per_layer_proj = ggml_mul_mat   (ctx0, model.per_layer_model_proj, inp_batch);
+    cb(per_layer_proj, "per_layer_proj_mm", -1);
     per_layer_proj = ggml_scale     (ctx0, per_layer_proj, per_layer_projection_scale);
     per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_per_layer, n_layer, n_tokens);
 
