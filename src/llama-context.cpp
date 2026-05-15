@@ -5322,6 +5322,15 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // DFlash K/V projection-cache update graphs are manually allocated into a
+    // single GPU buffer and executed directly with ggml_backend_graph_compute_async().
+    // They must not use graph_get_cb(), because that callback may call
+    // ggml_backend_sched_set_tensor_backend() for norm tensors.
+    const llm_graph_cb cb =
+        gtype == LLM_GRAPH_TYPE_DFLASH_KV_UPDATE
+            ? graph_get_cb_name_only()
+            : graph_get_cb();
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -5340,7 +5349,7 @@ llm_graph_params llama_context::graph_params(
         /*.tree_n_recurrent_layers =*/ (int)tree_bufs.ssm_intermediates.size(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ cb,
         /*.res         =*/ res,
     };
 }
@@ -5372,6 +5381,16 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+llm_graph_cb llama_context::graph_get_cb_name_only() const {
+    return [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
+        if (il >= 0) {
+            ggml_format_name(cur, "%s-%d", name, il);
+        } else {
+            ggml_set_name(cur, name);
+        }
+    };
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
