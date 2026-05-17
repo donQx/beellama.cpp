@@ -1813,6 +1813,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     vocab_tgt_n == vocab_dft_n ? 1 : 0,
                     capture_min,
                     capture_max);
+
+            if (!common_speculative_are_compatible(model_tgt, model_dft_)) {
+                throw std::runtime_error(string_format(
+                    "dflash: target and drafter vocab are incompatible; DFlash cannot retokenize draft outputs "
+                    "(target_vocab=%d drafter_vocab=%d)",
+                    vocab_tgt_n, vocab_dft_n));
+            }
         }
 
         ring_buf.resize(n_target_layers);
@@ -2288,9 +2295,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
             const int K_flat = llama_get_logits_argmax_k(ctx_dft);
             if (argmax) {
-                // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
+                // GPU argmax path - only 64-128 bytes transferred instead of 15.9MB
                 for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
-                    if (argmax_probs && params.p_min > 0.0f && i > 1) {
+                    if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                         float log_prob = argmax_probs[i * K_flat];
                         float log_p_min = logf(params.p_min);
                         if (log_prob < log_p_min) {
@@ -3476,7 +3483,7 @@ void common_speculative_draft_batch(
 
         if (argmax) {
             for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
-                if (argmax_probs && params.p_min > 0.0f && i > 1) {
+                if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
                     if (log_prob < logf(params.p_min)) {
                         break;
