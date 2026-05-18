@@ -768,8 +768,8 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
     GGML_ASSERT(k > 0);
 
     // Grammar needs full-vocab rejection/resampling. Reasoning-budget tracking is
-    // safe while passthrough, but active forcing may require a token outside the
-    // reduced candidate set and must fall back to raw logits.
+    // safe while passthrough. A sampler that is already forcing may require a
+    // token outside the reduced candidate set and must fall back to raw logits.
     if (!common_sampler_supports_reduced(gsmpl)) {
         return {};
     }
@@ -802,7 +802,10 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
 
         const llama_token id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
         if (common_sampler_force_reasoning_end_on_eog(gsmpl, id)) {
-            return LLAMA_TOKEN_NULL;
+            // The reasoning-budget sampler is now in deterministic FORCING
+            // mode. Emit the first forced token directly so reduced verifier
+            // views do not need a full raw-logits fallback for this transition.
+            return common_reasoning_budget_next_forced_token(gsmpl->rbudget);
         }
 
         return id;

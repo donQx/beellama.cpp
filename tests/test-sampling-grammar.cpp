@@ -57,7 +57,7 @@ static void test_output_format_thinking_prefill(const char * vocab_file) {
     GGML_ASSERT(common_sampler_get_reasoning_budget_state(sampler.get()) == REASONING_BUDGET_COUNTING);
 }
 
-static void test_reduced_sampling_rejects_eos_during_active_reasoning(const char * vocab_file) {
+static void test_reduced_sampling_forces_reasoning_end_on_eos(const char * vocab_file) {
     auto mparams = llama_model_default_params();
     mparams.vocab_only = true;
 
@@ -89,6 +89,7 @@ static void test_reduced_sampling_rejects_eos_during_active_reasoning(const char
     params.reasoning_budget_forced = params.reasoning_budget_end;
     params.reasoning_budget_tokens = -1;
     params.reasoning_budget_tracking = true;
+    GGML_ASSERT(!params.reasoning_budget_forced.empty());
 
     std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler {
         common_sampler_init(model.get(), params),
@@ -107,8 +108,10 @@ static void test_reduced_sampling_rejects_eos_during_active_reasoning(const char
     const llama_tokens sampled = common_sampler_sample_reduced_and_accept_n(
             sampler.get(), candidate_ids, candidate_logits, 1, 2, draft);
 
-    GGML_ASSERT(sampled.empty());
-    GGML_ASSERT(common_sampler_get_reasoning_budget_state(sampler.get()) == REASONING_BUDGET_FORCING);
+    GGML_ASSERT(sampled.size() == 1);
+    GGML_ASSERT(sampled[0] == params.reasoning_budget_forced.front());
+    GGML_ASSERT(common_sampler_get_reasoning_budget_state(sampler.get()) ==
+            (params.reasoning_budget_forced.size() == 1 ? REASONING_BUDGET_DONE : REASONING_BUDGET_FORCING));
 }
 
 int main(int argc, char ** argv) {
@@ -121,7 +124,7 @@ int main(int argc, char ** argv) {
 
     try {
         test_output_format_thinking_prefill(argv[1]);
-        test_reduced_sampling_rejects_eos_during_active_reasoning(argv[1]);
+        test_reduced_sampling_forces_reasoning_end_on_eos(argv[1]);
     } catch (const std::exception & e) {
         fprintf(stderr, "unexpected exception: %s\n", e.what());
         llama_backend_free();

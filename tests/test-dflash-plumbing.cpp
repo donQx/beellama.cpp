@@ -606,6 +606,8 @@ int main(int argc, char ** argv) {
     ok &= expect(sampling_cpp.find("gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false }") != std::string::npos, "reduced verifier sampler must tolerate unsorted GPU top-K candidates");
     ok &= expect(sampling_cpp.find("common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING") != std::string::npos, "reduced verifier must allow passthrough reasoning-budget tracking");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must preserve reasoning-budget sampler state");
+    ok &= expect(sampling_cpp.find("common_reasoning_budget_next_forced_token(gsmpl->rbudget)") != std::string::npos,
+        "reduced verifier must emit the deterministic forced reasoning-end token when EOG starts forcing");
     ok &= expect(server_context.find("dflash_select_reduced_verify_plan") != std::string::npos, "server must explicitly choose reduced verifier eligibility");
     ok &= expect(server_context.find("dflash_reduced_sampler_chain_supported") != std::string::npos &&
                  server_context.find("sampler-order") != std::string::npos,
