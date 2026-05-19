@@ -46,19 +46,18 @@ int main(int argc, char ** argv) {
     const std::string root = argv[1];
     const std::string perplexity = read_file(root + "/tools/perplexity/perplexity.cpp");
     const std::string kl = slice_between(perplexity,
-            "static void kl_divergence(llama_context * ctx, const common_params & params)",
-            "if (kld.count < 100) return;");
+            "static bool kl_divergence(llama_context * ctx, const common_params & params)",
+            "if (kld.count < 100) return true;");
 
     ok &= expect(perplexity.find("static int ppl_max_logits_rows(int n_vocab, const common_params & params)") != std::string::npos,
         "perplexity must cap full-vocab logits rows to avoid multi-GiB output buffers");
-    ok &= expect(perplexity.find("PPL_LOGITS_MAGIC") != std::string::npos &&
-                 perplexity.find("'2'") != std::string::npos,
-        "perplexity logits cache format must use a versioned magic after streaming layout changes");
-    ok &= expect(perplexity.find("logits_stream.write(PPL_LOGITS_MAGIC, sizeof(PPL_LOGITS_MAGIC))") != std::string::npos &&
-                 perplexity.find("memcmp(PPL_LOGITS_MAGIC, check, sizeof(PPL_LOGITS_MAGIC))") != std::string::npos,
-        "perplexity logits writer/reader must use the same versioned magic");
-    ok &= expect(perplexity.find("unsupported log-probability file format") != std::string::npos,
-        "perplexity KL reader must reject incompatible logits cache files clearly");
+    ok &= expect(perplexity.find("_logits2") == std::string::npos,
+        "perplexity logits cache must not invalidate legacy _logits_ baselines");
+    ok &= expect(perplexity.find("logits_stream.write(\"_logits_\", 8)") != std::string::npos &&
+                 kl.find("strncmp(\"_logits_\", check, 8)") != std::string::npos,
+        "perplexity logits writer/reader must preserve the legacy _logits_ cache magic");
+    ok &= expect(perplexity.find("if (!kl_divergence(ctx, params))") != std::string::npos,
+        "perplexity KL failures must propagate to a nonzero process exit");
     ok &= expect(kl.find("const int max_logits_rows = ppl_max_logits_rows(n_vocab, params)") != std::string::npos,
         "KL divergence must use the bounded logits-row cap");
     ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)))") != std::string::npos,

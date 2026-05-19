@@ -37,8 +37,6 @@ struct results_log_softmax {
     float  prob;
 };
 
-static constexpr char PPL_LOGITS_MAGIC[8] = { '_', 'l', 'o', 'g', 'i', 't', 's', '2' };
-
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
     float max_logit = logits[0];
@@ -486,7 +484,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             return {};
         }
         LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write(PPL_LOGITS_MAGIC, sizeof(PPL_LOGITS_MAGIC));
+        logits_stream.write("_logits_", 8);
         logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
         if (!logits_stream.good()) {
             LOG_ERR("%s: failed writing logits header\n", __func__);
@@ -1748,25 +1746,25 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
-static void kl_divergence(llama_context * ctx, const common_params & params) {
+static bool kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.logits_file.empty()) {
         LOG_ERR("%s: you must provide a name of a file containing the log probabilities of the base model\n", __func__);
-        return;
+        return false;
     }
     std::ifstream in(params.logits_file.c_str(), std::ios::binary);
     if (!in) {
         LOG_ERR("%s: failed to open %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
     {
-        char check[sizeof(PPL_LOGITS_MAGIC)];
-        in.read(check, sizeof(check));
-        if (in.fail() || memcmp(PPL_LOGITS_MAGIC, check, sizeof(PPL_LOGITS_MAGIC)) != 0) {
-            LOG_ERR("%s: %s uses an unsupported log-probability file format\n", __func__, params.logits_file.c_str());
-            return;
+        char check[9]; check[8] = 0;
+        in.read(check, 8);
+        if (in.fail() || strncmp("_logits_", check, 8) != 0) {
+            LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
+            return false;
         }
     }
 
@@ -1775,6 +1773,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     if (n_ctx > llama_n_ctx(ctx)) {
         LOG_ERR("%s: %s has been computed with %u, while the current context is %d. Increase it with -c and retry\n",
                 __func__, params.logits_file.c_str(), n_ctx, params.n_ctx);
+        return false;
     }
 
     int n_vocab;
@@ -1783,16 +1782,17 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     in.read((char *)&n_chunk, sizeof(n_chunk));
     if (in.fail()) {
         LOG_ERR("%s: failed reading n_vocab, n_chunk from %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
     if (n_vocab != llama_vocab_n_tokens(vocab)) {
         LOG_ERR("%s: inconsistent vocabulary (%d vs %d)\n", __func__, n_vocab, llama_vocab_n_tokens(vocab));
+        return false;
     }
 
     std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk);
     if (in.read((char *)tokens.data(), tokens.size()*sizeof(tokens[0])).fail()) {
         LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
 
     const int n_ctx_i = static_cast<int>(n_ctx);
@@ -1874,7 +1874,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             if (llama_decode(ctx, batch)) {
                 LOG_ERR("%s : failed to decode\n", __func__);
                 llama_batch_free(batch);
-                return;
+                return false;
             }
 
             const int n_outputs = logits_end - logits_first;
@@ -1883,7 +1883,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 if (in.read((char *)log_probs_uint16.data(), log_probs_size).fail()) {
                     LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i);
                     llama_batch_free(batch);
-                    return;
+                    return false;
                 }
 
                 const auto * batch_logits = llama_get_logits(ctx);
@@ -1940,7 +1940,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     llama_batch_free(batch);
     LOG("\n");
 
-    if (kld.count < 100) return; // we do not wish to do statistics on so few values
+    if (kld.count < 100) return true; // we do not wish to do statistics on so few values
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
@@ -2036,6 +2036,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -2114,7 +2115,9 @@ int main(int argc, char ** argv) {
     } else if (params.multiple_choice) {
         multiple_choice_score(ctx, params);
     } else if (params.kl_divergence) {
-        kl_divergence(ctx, params);
+        if (!kl_divergence(ctx, params)) {
+            return 1;
+        }
     } else {
         results = perplexity(ctx, params, n_ctx);
     }
