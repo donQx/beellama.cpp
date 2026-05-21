@@ -4759,7 +4759,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
                             // MoE FFN
-                            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, 0);
+                            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
+
+                            if (layer.ffn_gate_up_exps == nullptr) {
+                                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                            }
+
                             layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
                             // per-expert scale will be loaded as down_exps_s at the end of the current switch case
@@ -8091,6 +8097,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
                 layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+        }
+        // output scales
+        if (output && output->type == GGML_TYPE_NVFP4) {
+            if (!output_s) {
+                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!output_in_s) {
+                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
     }
