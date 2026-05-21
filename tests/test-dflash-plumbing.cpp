@@ -292,6 +292,8 @@ int main(int argc, char ** argv) {
                  context_cpp.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
                  speculative.find("llama_dflash_target_kv_cache_update_from_ring(") != std::string::npos,
         "DFlash accepted target hiddens must also refresh the drafter base KV cache for full-attention layers");
+    ok &= expect(speculative.find("const int n_full_kv_update = std::min(n_update, drafter_prefix_window());") != std::string::npos,
+        "DFlash accepted-prefix full-KV commits must clamp to the drafter prefix window so small -cd stays safe");
     ok &= expect(context_cpp.find("base_kv->seq_rm(seq_id, start_pos, -1);") != std::string::npos,
         "DFlash accepted-prefix full-KV commits must replace only the tail suffix instead of overwriting occupied base-KV cells in place");
     ok &= expect(context_cpp.find("reuse_update_buf &&\n            dflash_kv_cache &&\n            dflash_kv_cache->fn_wait_backend_stream &&\n            dflash_kv_cache->fn_wait_backend_stream(gpu_backend)") != std::string::npos,

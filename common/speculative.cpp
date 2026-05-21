@@ -1804,23 +1804,27 @@ struct common_speculative_state_dflash : public common_speculative_state {
         trim_drafter_prefix_window();
 
         const int n_update = std::min(n_written, cross_ctx);
+        const int n_full_kv_update = std::min(n_update, drafter_prefix_window());
         const int gpu_write_pos = ring_write_pos % cross_ctx;
         const int gpu_filled = std::min(ring_filled, cross_ctx);
-        const llama_pos start_pos = committed_len - n_written;
 
-        const bool full_kv_ok = llama_dflash_target_kv_cache_update_from_ring(
-            ctx_dft, gpu_ring_handle,
-            gpu_write_pos, gpu_filled,
-            n_target_layers, n_embd, n_update,
-            seq_id, start_pos);
-        if (!full_kv_ok) {
-            static bool warned_full_kv = false;
-            if (!warned_full_kv) {
-                LOG_WRN("dflash: accepted target-hidden full-KV commit failed; clearing drafter KV suffix for seq=%d start=%d\n",
-                        seq_id, (int) start_pos);
-                warned_full_kv = true;
+        if (n_full_kv_update > 0) {
+            const llama_pos start_pos = committed_len - n_full_kv_update;
+
+            const bool full_kv_ok = llama_dflash_target_kv_cache_update_from_ring(
+                ctx_dft, gpu_ring_handle,
+                gpu_write_pos, gpu_filled,
+                n_target_layers, n_embd, n_full_kv_update,
+                seq_id, start_pos);
+            if (!full_kv_ok) {
+                static bool warned_full_kv = false;
+                if (!warned_full_kv) {
+                    LOG_WRN("dflash: accepted target-hidden full-KV commit failed; clearing drafter KV suffix for seq=%d start=%d\n",
+                            seq_id, (int) start_pos);
+                    warned_full_kv = true;
+                }
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, start_pos, -1);
             }
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, start_pos, -1);
         }
 
         if (common_dflash_kv_cache_disabled()) {
