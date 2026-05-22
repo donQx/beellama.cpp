@@ -34,8 +34,8 @@ TurboQuant (WHT-based scalar quantization) originates from [TheTom/llama-cpp-tur
 DFlash is strongest on structured, repetitive generation: code, tests, boilerplate, JSON-like formats, and other low-entropy continuations. Open-ended prose is much less predictable, so gains are smaller.
 
 * Setup: Windows 11, AMD Ryzen 7 5700X3D, 32 GB DDR4 RAM, RTX 3090 24 GB
-* Config: same as recommended in quick start docs ([Qwen 3.6 27B](docs/quickstart-qwen36-dflash.md), [Gemma 4 31B](docs/quickstart-gemma-4-31b-dflash.md))
-* Baseline and MTP in comparison: llama.cpp [b9275](https://github.com/ggml-org/llama.cpp/releases/tag/b9275) CUDA 13.1 Windows prebuilt
+* Config: same as in quick start docs ([Qwen 3.6 27B](docs/quickstart-qwen36-dflash.md), [Gemma 4 31B](docs/quickstart-gemma-4-31b-dflash.md)), but with reasoning off for non-chat prompts
+* Baseline and MTP server in comparison: llama.cpp [b9275](https://github.com/ggml-org/llama.cpp/releases/tag/b9275) CUDA 13.1 Windows prebuilt
 
 <details>
 <summary>Benchmark prompts</summary>
