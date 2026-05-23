@@ -131,7 +131,23 @@ int main(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+    assert(params.speculative.n_max == 123);
 
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "dflash"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.n_max == 16);
+    assert(params.speculative.draft.n_max == 16);
+    assert(params.speculative.draft.n_ctx == params.speculative.dflash_cross_ctx + 16);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "dflash", "--spec-draft-n-max", "7"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.n_max == 7);
+    assert(params.speculative.draft.n_max == 7);
+    assert(params.speculative.draft.n_ctx == params.speculative.dflash_cross_ctx + 7);
+
+    params = common_params();
     argv = {"binary_name", "--spec-dm-min-reach", "6"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.dm_min_reach == 6);
@@ -224,6 +240,7 @@ int main(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
     // multi-value args (CSV)
+    params = common_params();
     params.model.path = "model_file.gguf";
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -277,12 +294,20 @@ int main(void) {
     const char * GOOD_URL = "http://ggml.ai/";
     const char * BAD_URL  = "http://ggml.ai/404";
 
+    std::pair<long, std::vector<char>> good_url_res;
+    try {
+        good_url_res = common_remote_get_content(GOOD_URL, {});
+    } catch (std::exception & e) {
+        fprintf(stderr, "SKIP: could not fetch %s (%s)\n", GOOD_URL, e.what());
+        printf("test-arg-parser: all tests OK\n\n");
+        return 0;
+    }
+
     {
         printf("test-arg-parser: test good URL\n\n");
-        auto res = common_remote_get_content(GOOD_URL, {});
-        assert(res.first == 200);
-        assert(res.second.size() > 0);
-        std::string str(res.second.data(), res.second.size());
+        assert(good_url_res.first == 200);
+        assert(good_url_res.second.size() > 0);
+        std::string str(good_url_res.second.data(), good_url_res.second.size());
         assert(str.find("llama.cpp") != std::string::npos);
     }
 

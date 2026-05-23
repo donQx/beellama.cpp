@@ -952,8 +952,13 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
 
 static void common_params_speculative_normalize(common_params & params) {
     auto & s = params.speculative;
+    const bool has_dflash = std::find(s.types.begin(), s.types.end(), COMMON_SPECULATIVE_TYPE_DFLASH) != s.types.end();
 
-    s.n_max = s.draft.n_max;
+    if (has_dflash && !s.n_max_explicit) {
+        s.draft.n_max = s.n_max;
+    } else {
+        s.n_max = s.draft.n_max;
+    }
     s.n_min = s.draft.n_min;
 
     if (s.legacy_tree_budget_explicit && !s.branch_budget_explicit) {
@@ -3737,6 +3742,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.speculative.draft.n_max = value;
             params.speculative.n_max       = value;
+            params.speculative.n_max_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
@@ -3982,6 +3988,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             params.speculative.draft.n_max = value;
+            params.speculative.n_max       = value;
+            params.speculative.n_max_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4559,7 +4567,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DFLASH };
             params.speculative.p_min = 0.0f;
-            params.speculative.n_max = 7;
+            params.speculative.n_max = 16;
+            params.speculative.draft.n_max = 16;
+            params.speculative.n_max_explicit = true;
             params.speculative.n_min = 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));

@@ -343,7 +343,7 @@ Presets:
 | Arg | Behavior |
 | --- | --- |
 | `--spec-default` | Sets `ngram-mod` with match `24`, min `48`, max `64`. |
-| `--spec-dflash-default` | Sets DFlash mode with `p_min=0`, `n_max=16`, `n_min=0`. Prefer explicit `--spec-type dflash --spec-draft-model ... --spec-draft-n-max ...` for reproducible commands, because normal speculative normalization copies draft `n_max/n_min` after parsing. |
+| `--spec-dflash-default` | Sets DFlash mode with `p_min=0`, `n_max=16`, `n_min=0`. Prefer explicit `--spec-type dflash --spec-draft-model ... --spec-draft-n-max ...` for reproducible commands. |
 
 Removed generic ngram args:
 

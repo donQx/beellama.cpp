@@ -376,6 +376,7 @@ struct common_params_speculative {
     int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
     int32_t n_max_base   = 0;  // user's original --draft-max before adaptive DM reduction (0 = use n_max)
     int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
+    bool    n_max_explicit = false; // user explicitly set draft max; preserve across DFlash normalization
     int32_t branch_budget = 0; // DDTree branch nodes beyond the main draft path (0 = flat DFlash)
     int32_t tree_budget   = -1; // legacy total-node --tree-budget input; normalized after parsing
     bool    branch_budget_explicit = false;
