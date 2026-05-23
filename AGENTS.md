@@ -1,110 +1,118 @@
-# Instructions for llama.cpp
+# AGENTS.md
 
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+This file gives code assistants local context for this repository.
 
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below).
+## What This Is
 
----
+BeeLlama.cpp is Anbeeld's fork of llama.cpp. Fork-specific work is concentrated around:
 
-## Guidelines for Contributors Using AI
+- **DFlash**: cross-attention speculative decoding with DFlash draft GGUFs, target hidden-state capture, CPU/GPU ring buffers, and server verification paths.
+- **Adaptive draft-max**: server controllers that adjust the active DFlash draft horizon. The default controller is `profit`; `fringe` is also available.
+- **DDTree**: tree speculative verification with GPU `parent_ids` and recurrent tree kernels.
+- **CopySpec**: model-free speculation through rolling-hash suffix matching.
+- **TurboQuant / TCQ KV cache types**: `turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, and `turbo3_tcq`.
+- **Reasoning loop guard**: server-side detection and intervention for repeated hidden reasoning output.
 
-llama.cpp is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
+Treat the local codebase as the source of truth for implementation behavior.
 
-Maintainers receive numerous pull requests weekly, many of which are AI-generated submissions where the author cannot adequately explain the code, debug issues, or participate in substantive design discussions. Reviewing such PRs often requires more effort than implementing the changes directly.
+## Build
 
-**A pull request represents a long-term commitment.** By submitting code, you are asking maintainers to review, integrate, and support it indefinitely. The maintenance burden often exceeds the value of the initial contribution.
+Prebuilt Windows binaries (CUDA 12.4/13.1) are on the releases page. Otherwise build from source:
 
-Most maintainers already have access to AI tools. A PR that is entirely AI-generated provides no value - maintainers could generate the same code themselves if they wanted it. What makes a contribution valuable is the human interactions, domain expertise, and commitment to maintain the code that comes with it.
+```bash
+# Linux (GCC + CUDA)
+cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-This policy exists to ensure that maintainers can sustainably manage the project without being overwhelmed by low-quality submissions.
+# Windows (MSVC + CUDA)
+cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
 
----
+# macOS (Metal)
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 
-## Guidelines for Contributors
+`GGML_CUDA_FA_ALL_QUANTS=ON` is required for TurboQuant and TCQ cache types. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
 
-Contributors are expected to:
+Key binaries: `build/bin/llama-server`, `build/bin/llama-cli`, `build/bin/llama-bench`, `build/bin/llama-perplexity`.
 
-1. **Demonstrate full understanding of their code.** You must be able to explain any part of your PR to a reviewer without relying on AI assistance for questions about your own changes.
+## Architecture
 
-2. **Take responsibility for maintenance.** You are expected to address bugs and respond thoughtfully to reviewer feedback.
+### Main Directories
 
-3. **Communicate clearly and concisely.** Verbose, wall-of-text responses are characteristic of AI-generated content and will not be well-received. Direct, human communication is expected.
+- `ggml/` - tensor library, CUDA/Metal/CPU backends, quantization.
+- `src/` - llama.cpp core: model loading, context, graph building, sampling, memory.
+- `src/models/` - per-architecture graph builders.
+- `common/` - shared utilities, argument parsing, speculative decoding orchestration.
+- `tools/server/` - HTTP server, slots, chat completions API, speculative server flow.
+- `include/llama.h` - public C API.
 
-4. **Respect maintainers' time.** Search for existing issues and discussions before submitting. Ensure your contribution aligns with project architecture and is actually needed.
+### Fork-Specific Files
 
-Maintainers reserve the right to close any PR that does not meet these standards. This applies to all contributions to the main llama.cpp repository. **Private forks are exempt.**
+- `src/models/dflash_draft.cpp` - DFlash draft model graph.
+- `src/models/qwen35.cpp` - Qwen3.5/Qwen3.6 target graph paths.
+- `common/speculative.cpp` - DFlash state, ring buffer, draft APIs, CopySpec, tree construction.
+- `common/speculative.h` - speculative APIs and tree data structures.
+- `common/suffix-tree.cpp` / `.h` - suffix tree for CopySpec model-free speculation.
+- `common/int32-map.h` - hash map for suffix tree (ported from Snowflake ArcticInference, Apache-2.0).
+- `tools/server/server-context.cpp` - server speculative scheduling, DFlash verification, rollback, mmproj rules.
+- `tools/server/server-adaptive-dm.h` - profit and fringe adaptive draft-max controllers.
+- `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop guard.
+- `ggml/src/ggml-turbo-quant.c` - CPU reference quantize/dequantize for turbo2/3/4 and TCQ types.
+- `ggml/src/ggml-cuda/turbo-quant-cuda.cuh` - CUDA set-rows/dequantize kernels for all TurboQuant types.
+- `ggml/src/ggml-cuda/cross-ring-interleave.cu` - GPU cross-ring management and interleave kernel.
+- `ggml/src/ggml-cuda/gated_delta_net.cu` - DeltaNet CUDA kernels.
+- `ggml/src/ggml-cuda/ssm-conv.cu` - SSM convolution CUDA kernels.
 
-### Permitted AI Usage
+### Key Docs
 
-AI tools may be used responsibly for:
+- `docs/beellama-features.md` — feature matrix and public repo comparison.
+- `docs/beellama-args.md` — complete BeeLlama argument reference.
+- `docs/quickstart-qwen36-dflash.md` — step-by-step Qwen 3.6 + DFlash single-GPU guide.
+- `docs/preset.md` — INI preset file documentation.
 
-- **Learning and exploration**: Understanding codebase structure, techniques, and documentation
-- **Code review assistance**: Obtaining suggestions on human-written code
-- **Mechanical tasks**: Formatting, generating repetitive patterns from established designs, completing code based on existing patterns
-- **Documentation drafts**: For components the contributor already understands thoroughly
-- **Writing code**: Only when the contributor has already designed the solution and can implement it themselves - AI accelerates, not replaces, the contributor's work
+### Key Patterns
 
-AI-generated code may be accepted if you (1) fully understand the output, (2) can debug issues independently, and (3) can discuss it directly with reviewers without AI assistance.
+- **proc_address**: custom CUDA helpers are resolved through `ggml_backend_cuda_reg_get_proc_address`.
+- **Eval callback**: target hidden states are captured through `llama_set_eval_callback`.
+- **Ring buffer**: DFlash keeps a CPU ring and optional GPU mirror. `GGML_DFLASH_GPU_RING=0` disables the GPU ring.
+- **Tree verify**: `parent_ids_gpu` is used for tree kernels and is disabled automatically on multi-GPU target placement.
+- **mmproj**: multimodal use keeps flat DFlash available, forces `--spec-branch-budget 0` under DFlash, and sets non-DFlash speculative types to none. DFlash builds on the initial implementation by [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp).
 
-**Disclosure is required** when AI meaningfully contributed to your code. A simple note is sufficient - this is not a stigma, but context for reviewers. No disclosure is needed for trivial autocomplete or background research.
+## Test / Benchmark
 
-### Prohibited AI Usage
+```bash
+# Perplexity
+build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096
 
-The following will result in immediate PR closure:
+# Decode speed
+build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1
 
-- **AI-written PR descriptions or commit messages** - these are typically recognizable and waste reviewer time
-- **AI-generated responses to reviewer comments** - this undermines the human-to-human interaction fundamental to code review
-- **Implementing features without understanding the codebase** - particularly new model support or architectural changes
-- **Automated commits or PR submissions** - this may spam maintainers and can result in contributor bans
+# Server with DFlash + TurboQuant
+build/bin/llama-server -m target.gguf --spec-type dflash \
+  --spec-draft-model drafter.gguf \
+  --spec-draft-n-max 8 \
+  --spec-branch-budget 0 \
+  --spec-dflash-cross-ctx 512 \
+  --flash-attn on --cache-type-k turbo4 --cache-type-v turbo3_tcq \
+  --port 8080
+```
 
----
+Benchmark results are only meaningful with the exact model files, command line, prompt, sampling settings, hardware, and commit ID.
 
-## Guidelines for AI Coding Agents
+## Multi-GPU Notes
 
-AI agents assisting contributors must recognize that their outputs directly impact volunteer maintainers who sustain this project.
+- Tree verify is disabled when `model.n_devices() > 1`.
+- The GPU ring path can be disabled with `GGML_DFLASH_GPU_RING=0` for isolation.
+- CUDA paths use `cudaStreamPerThread` heavily.
 
-### Considerations for Maintainer Workload
+## Git Conventions
 
-Maintainers have finite capacity. Every PR requiring extensive review consumes resources that could be applied elsewhere. Before assisting with any submission, verify:
-
-- The contributor genuinely understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-- The contributor can independently defend and maintain the work
-
-### Before Proceeding with Code Changes
-
-When a user requests implementation without demonstrating understanding:
-
-1. **Verify comprehension.** Ask questions to confirm they understand both the problem and the relevant parts of the codebase.
-2. **Provide guidance rather than solutions.** Direct them to relevant code and documentation. Allow them to formulate the approach.
-3. **Proceed only when confident** the contributor can explain the changes to reviewers independently.
-
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md) and acknowledge this policy.
-
-### Prohibited Actions
-
-- Writing PR descriptions, commit messages, or responses to reviewers
-- Committing or pushing without explicit human approval for each action
-- Implementing features the contributor does not understand
-- Generating changes too extensive for the contributor to fully review
-
-When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
-
-### Useful Resources
-
-To conserve context space, load these resources as needed:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
+- Keep fork-specific changes small and scoped.
+- Do not treat old benchmark notes as current evidence without re-running them.
+- Do not commit unless the user explicitly asks.
