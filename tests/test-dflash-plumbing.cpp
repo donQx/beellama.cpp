@@ -380,6 +380,11 @@ int main(int argc, char ** argv) {
     ok &= expect(delta_net_base.find("ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);") != std::string::npos &&
                  delta_net_base.find("ggml_reshape_3d(ctx0, s, S_v * S_v * H_v, 1, n_seqs)") == std::string::npos,
         "DeltaNet fused K=1 path must pass the existing 4D recurrent state directly instead of adding a per-layer reshape");
+    ok &= expect(delta_net_base.find("tree_parent_ids && n_seq_tokens > 1 && n_seqs_in == 1 && tree_ssm_intermediates") != std::string::npos &&
+                 delta_net_base.find("n_seq_tokens <= ggml_nelements(tree_parent_ids)") != std::string::npos &&
+                 delta_net_base.find("ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter)") != std::string::npos &&
+                 delta_net_base.find("cb(result, \"fgdn_tree\", il)") != std::string::npos,
+        "DeltaNet must preserve the DDTree tree-aware GDN path for single-sequence multi-token verification batches");
     ok &= expect(dflash_profile_h.find("GGML_DFLASH_PROFILE") != std::string::npos, "DFlash profile helper must honor profiling flag");
     ok &= expect(speculative.find("gpu_sync=%.3f ms") != std::string::npos, "DFlash ring profiling must report GPU sync time");
     ok &= expect(speculative.find("kv_cache_update requested=%d update=%d") != std::string::npos, "DFlash accept profiling must report drafter K/V cache update time");
