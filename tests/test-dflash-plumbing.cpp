@@ -106,6 +106,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec_turbo3_tcq_q8_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu");
     const std::string cuda_fattn_vec_turbo3_tcq_turbo3_tcq = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
+    const std::string metal = read_file(root + "/ggml/src/ggml-metal/ggml-metal.metal");
 
     ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
     ok &= expect(dflash_profile_parse_env("0") == 0, "DFlash profile parser must treat 0 as disabled");
@@ -291,6 +292,15 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_draft.find("dflash_build_base_attn_input") != std::string::npos &&
                  dflash_draft.find("static_cast<const llama_kv_cache_iswa_context *>(mctx)->get_base()") != std::string::npos,
         "DFlash full-attention layers must read accepted-prefix KV from the drafter base cache, not the cross window");
+    ok &= expect(speculative.find("common_dflash_align_drafter_seq_or_clear") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache") != std::string::npos,
+        "DFlash must have explicit helpers for clearing stale drafter sequence memory and projection cache");
+    ok &= expect(count_occurrences(speculative, "common_dflash_align_drafter_seq_or_clear(ctx_dft") >= 3,
+        "DFlash draft paths must clear stale drafter memory before decoding at absolute committed positions");
+    ok &= expect(speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"first prefill flush\")") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"capture target hiddens\")") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"ring state load\")") != std::string::npos,
+        "DFlash ring reset/restore paths must clear ctx_dft sequence memory so the next draft batch is consecutive");
     ok &= expect(dflash_draft.find("class llm_graph_input_attn_kv_backend final : public llm_graph_input_attn_kv") != std::string::npos &&
                  dflash_draft.find("mctx->set_input_k_idxs_backend(self_k_idxs, ubatch);") != std::string::npos &&
                  dflash_draft.find("mctx->set_input_v_idxs_backend(self_v_idxs, ubatch);") != std::string::npos &&
@@ -804,7 +814,8 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("n_hidden_keep = ids.empty() ? 0 : n_accepted_draft + 1") != std::string::npos, "DFlash ring/tape keep count must include root plus accepted draft tokens");
     ok &= expect(server_context.find("common_speculative_accept(slot.get_spec(), n_accepted_draft)") != std::string::npos, "speculative stats must count accepted draft tokens, not bonus-token-shaped results");
     ok &= expect(server_context.find("llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep)") != std::string::npos, "DFlash rollback must use the hidden-state keep count at grammar boundaries");
-    ok &= expect(server_context.find("dflash_suppressed_for_reasoning_tool_marker") != std::string::npos, "server must disable DFlash after raw tool markers inside hidden reasoning without steering generation");
+    ok &= expect(server_context.find("dflash_suppressed_for_reasoning_tool_marker") == std::string::npos,
+        "server must not globally disable DFlash for the rest of a response after a raw tool marker; lazy grammar boundaries must be precise");
     ok &= expect(server_task.find("state.update_chat_msg(content, true, oaicompat_msg_diffs, true)") != std::string::npos, "streaming responses must filter partial tool-call deltas");
     ok &= expect(server_task.find("state.update_chat_msg(content, false, oaicompat_msg_diffs, true)") != std::string::npos ||
                  server_task_h.find("state.update_chat_msg(content, false, oaicompat_msg_diffs, true)") != std::string::npos,
@@ -816,7 +827,9 @@ int main(int argc, char ** argv) {
     ok &= expect(server_task.find("task_result_pos_is_in_code_fence") != std::string::npos, "raw marker quarantine must avoid code fence content");
     ok &= expect(server_task.find("task_result_starts_with_raw_tool_marker") != std::string::npos, "streaming responses must suppress parser fallback text for wrapperless raw tool calls");
     ok &= expect(server_task.find("task_result_freeze_text_fields") != std::string::npos, "incomplete parsed tool calls must not leak fallback text/reasoning deltas");
-    ok &= expect(server_context.find("raw tool marker observed while lazy grammar is enabled") != std::string::npos, "DFlash must suppress after raw tool markers even outside parsed reasoning");
+    ok &= expect(server_context.find("raw tool marker observed while lazy grammar is enabled") != std::string::npos &&
+                 server_context.find("suppressing DFlash for this response") == std::string::npos,
+        "server may log raw tool markers, but must keep DFlash available outside active lazy-grammar boundaries");
     ok &= expect(server_context.find("server_tail_pos_is_in_code_fence") != std::string::npos, "DFlash raw-marker suppression must avoid fenced code content");
     ok &= expect(server_context.find("server_tail_tool_marker_has_boundary") != std::string::npos, "DFlash raw-marker suppression must avoid embedded string false positives");
     ok &= expect(chat_auto_parser_generator.find("allow_direct_func_start") != std::string::npos, "tag-style parsers must accept valid direct function starts without outer wrappers");
@@ -835,6 +848,18 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_draft.find("skip_target_hidden_upload") != std::string::npos &&
                  dflash_draft.find("use_kv_cache && dflash_kv_cache_mode_env() == DFLASH_KV_CACHE_BOTH") != std::string::npos,
         "DFlash drafter must skip unused cross-hidden uploads when the full K/V projection cache is active");
+    ok &= expect(metal.find("constant float turbo_centroids_4bit[16]") != std::string::npos &&
+                 metal.find("constant float turbo_mid_4bit[15]") != std::string::npos &&
+                 metal.find("turbo_find_nearest_4bit") != std::string::npos,
+        "Metal Turbo4 must use the same pure 4-bit codebook as CUDA");
+    ok &= expect(metal.find("QK_TURBO4 * 3 / 8") == std::string::npos &&
+                 metal.find("dst.rnorm") == std::string::npos &&
+                 metal.find("xb->rnorm") == std::string::npos &&
+                 metal.find("xb->signs[j / 8]") == std::string::npos,
+        "Metal Turbo4 must not use the removed 3-bit+QJL rnorm/signs layout");
+    ok &= expect(metal.find("dst.qs[j / 2] = (idx1 << 4) | idx0") != std::string::npos &&
+                 metal.find("turbo_centroids_4bit[idx] * norm") != std::string::npos,
+        "Metal Turbo4 must pack two 4-bit indices per byte and dequantize through 4-bit centroids");
     ok &= expect(speculative.find("if (common_dflash_debug_logs_enabled())") != std::string::npos &&
                  speculative.find("DFLASH_DBG append_target_hiddens") != std::string::npos,
         "DFlash append-target diagnostics must stay behind the debug logging gate");

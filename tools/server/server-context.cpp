@@ -551,7 +551,6 @@ struct server_slot : server_adaptive_dm_state {
     std::string loop_guard_action;
     std::string loop_guard_reason;
     bool reasoning_tool_marker_logged = false;
-    bool dflash_suppressed_for_reasoning_tool_marker = false;
     int32_t reasoning_output_tokens = 0;
     int32_t visible_output_tokens = 0;
 
@@ -673,7 +672,6 @@ struct server_slot : server_adaptive_dm_state {
         loop_guard_action = "";
         loop_guard_reason = "";
         reasoning_tool_marker_logged = false;
-        dflash_suppressed_for_reasoning_tool_marker = false;
         reasoning_output_tokens = 0;
         visible_output_tokens = 0;
         stopping_word  = "";
@@ -2836,9 +2834,8 @@ private:
 
                 if (server_tail_has_tool_call_marker(slot.generated_text, marker_scan_pos)) {
                     slot.reasoning_tool_marker_logged = true;
-                    slot.dflash_suppressed_for_reasoning_tool_marker = true;
                     SLT_WRN(slot,
-                            "raw tool marker observed while lazy grammar is enabled; suppressing DFlash for this response without changing sampler state in_reasoning=%d n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
+                            "raw tool marker observed while lazy grammar is enabled; keeping DFlash governed by active grammar boundary in_reasoning=%d n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
                             in_reasoning ? 1 : 0,
                             slot.n_decoded,
                             slot.reasoning_output_tokens,
@@ -3872,11 +3869,8 @@ private:
             const bool dflash_sampler_blocks_speculative =
                 params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                 slot.smpl && common_sampler_blocks_speculative(slot.smpl.get());
-            const bool dflash_tool_marker_suppressed =
-                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                slot.dflash_suppressed_for_reasoning_tool_marker;
 
-            if (n_draft_max > 0 && !dflash_sampler_blocks_speculative && !dflash_tool_marker_suppressed) {
+            if (n_draft_max > 0 && !dflash_sampler_blocks_speculative) {
                 const int64_t t_draft_slot_start = ggml_time_us();
 
                 if (mctx && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {

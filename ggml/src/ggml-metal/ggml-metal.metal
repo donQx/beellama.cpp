@@ -513,10 +513,53 @@ constant float turbo_centroids_3bit[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
+constant float turbo_centroids_4bit[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f
+};
 // Midpoints for 2-bit nearest centroid lookup
 constant float turbo_mid_2bit[3] = { -0.086728f, 0.0f, 0.086728f };
 // Midpoints for 3-bit
 constant float turbo_mid_3bit[7] = { -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f };
+constant float turbo_mid_4bit[15] = {
+    -0.212232f, -0.162977f, -0.127056f, -0.097191f, -0.070693f,
+    -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
+     0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f
+};
+
+static uint8_t turbo_find_nearest_4bit(float val) {
+    if (val < turbo_mid_4bit[7]) {
+        if (val < turbo_mid_4bit[3]) {
+            if (val < turbo_mid_4bit[1]) {
+                return val < turbo_mid_4bit[0] ? 0 : 1;
+            } else {
+                return val < turbo_mid_4bit[2] ? 2 : 3;
+            }
+        } else {
+            if (val < turbo_mid_4bit[5]) {
+                return val < turbo_mid_4bit[4] ? 4 : 5;
+            } else {
+                return val < turbo_mid_4bit[6] ? 6 : 7;
+            }
+        }
+    } else {
+        if (val < turbo_mid_4bit[11]) {
+            if (val < turbo_mid_4bit[9]) {
+                return val < turbo_mid_4bit[8] ? 8 : 9;
+            } else {
+                return val < turbo_mid_4bit[10] ? 10 : 11;
+            }
+        } else {
+            if (val < turbo_mid_4bit[13]) {
+                return val < turbo_mid_4bit[12] ? 12 : 13;
+            } else {
+                return val < turbo_mid_4bit[14] ? 14 : 15;
+            }
+        }
+    }
+}
 
 // Quantize 32 elements into one block_turbo3_0 (NO rotation — rotation happens
 // at the 128-element group level in kernel_set_rows_turbo)
@@ -559,59 +602,30 @@ void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
     for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
     float norm = sqrt(norm_sq);
     float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
-    dst.norm = half(norm);
-
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
-    float normalized[128];
-    for (int j = 0; j < 128; j++) normalized[j] = x[j];
 
     // Step 2: WHT rotate in-place
     turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
 
-    // Step 3: 3-bit quantization
-    for (int j = 0; j < QK_TURBO4 * 3 / 8; j++) dst.qs[j] = 0;
-    for (int j = 0; j < QK_TURBO4 / 8; j++) dst.signs[j] = 0;
-
-    float recon[128];
-    for (int j = 0; j < 128; j++) {
-        float val = x[j];
-        uint8_t idx;
-        if      (val < turbo_mid_3bit[0]) idx = 0;
-        else if (val < turbo_mid_3bit[1]) idx = 1;
-        else if (val < turbo_mid_3bit[2]) idx = 2;
-        else if (val < turbo_mid_3bit[3]) idx = 3;
-        else if (val < turbo_mid_3bit[4]) idx = 4;
-        else if (val < turbo_mid_3bit[5]) idx = 5;
-        else if (val < turbo_mid_3bit[6]) idx = 6;
-        else                              idx = 7;
-        recon[j] = turbo_centroids_3bit[idx];
-
-        int bit_offset = j * 3;
-        int byte_idx = bit_offset / 8;
-        int bit_pos = bit_offset % 8;
-        dst.qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
-        if (bit_pos > 5 && byte_idx + 1 < QK_TURBO4 * 3 / 8) {
-            dst.qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
-        }
+    // Step 3: 4-bit quantization
+    for (int j = 0; j < 128; j += 2) {
+        uint8_t idx0 = turbo_find_nearest_4bit(x[j]);
+        uint8_t idx1 = turbo_find_nearest_4bit(x[j + 1]);
+        dst.qs[j / 2] = (idx1 << 4) | idx0;
     }
 
-    // Step 4: inverse WHT rotation + residual
+    // Step 4: norm correction in rotated centroid space
     // turbo_rotate_inverse REMOVED — pre-rotate-queries handles this
-    float rnorm_sq = 0.0f;
+    float recon_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        x[j] = normalized[j] - recon[j]; // residual in x buffer
-        rnorm_sq += x[j] * x[j];
+        uint8_t idx = (j & 1) ? (dst.qs[j / 2] >> 4) : (dst.qs[j / 2] & 0xF);
+        float r = turbo_centroids_4bit[idx];
+        recon_sq += r * r;
     }
-    dst.rnorm = half(sqrt(rnorm_sq));
-
-    // Step 5: QJL WHT signs
-    turbo_rotate_forward(x, turbo_qjl_wht_signs1, turbo_qjl_wht_signs2);
-    for (int i = 0; i < 128; i++) {
-        if (x[i] >= 0.0f) {
-            dst.signs[i / 8] |= (1 << (i % 8));
-        }
-    }
+    float recon_norm = sqrt(recon_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst.norm = half(corrected_norm);
 }
 
 // ----- turbo3 dequantize with per-thread block cache -----
@@ -716,34 +730,15 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 
 static void turbo4_dequantize_full_block(device const block_turbo4_0 * xb, thread float * cache) {
     const float norm  = float(xb->norm);
-    const float rnorm = float(xb->rnorm);
-    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
-
     // Unpack 3-bit indices → centroids, then inverse WHT
-    float recon[128];
     for (int j = 0; j < 128; j++) {
-        int bit_offset = j * 3;
-        int byte_idx = bit_offset / 8;
-        int bit_pos = bit_offset % 8;
-        uint16_t raw = (uint16_t)xb->qs[byte_idx];
-        if (byte_idx + 1 < QK_TURBO4 * 3 / 8) {
-            raw |= (uint16_t)xb->qs[byte_idx + 1] << 8;
-        }
-        uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
-        recon[j] = turbo_centroids_3bit[idx];
+        uint8_t idx = (j & 1) ? (xb->qs[j / 2] >> 4) : (xb->qs[j / 2] & 0xF);
+        cache[j] = turbo_centroids_4bit[idx] * norm;
     }
     // turbo_rotate_inverse REMOVED — pre-rotate-queries handles this
 
-    // QJL: unpack signs, inverse WHT, scale
-    float signs_f[128];
-    for (int j = 0; j < 128; j++) {
-        signs_f[j] = (xb->signs[j / 8] & (1 << (j % 8))) ? 1.0f : -1.0f;
-    }
     // turbo_rotate_inverse(QJL) REMOVED — pre-rotate-queries handles this
 
-    for (int i = 0; i < 128; i++) {
-        cache[i] = (recon[i] + signs_f[i] * qjl_scale) * norm;
-    }
 }
 
 template <typename type4x4>
