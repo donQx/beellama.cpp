@@ -261,6 +261,8 @@ int main(int argc, char ** argv) {
                  cuda_fattn.find("#if defined(GGML_USE_HIP)") != std::string::npos &&
                  cuda_fattn.find("!hip_native_tcq_decode && !turbo_decode_native && turbo_kv") != std::string::npos,
         "HIP TCQ decode must stay on the native VEC path instead of dequantizing into generic tile/MMA FlashAttention");
+    ok &= expect(cuda_fattn.find("turbo_mma_fused && turbo_matched && Q->ne[1] <= 4") != std::string::npos,
+        "fused Turbo MMA must stay limited to decode-sized batches so Turbo prefill uses the pipelined path");
     ok &= expect(cuda_fattn.find("D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally") == std::string::npos &&
                  cuda_fattn.find("if (Q->ne[0] == 512) {\n        return BEST_FATTN_KERNEL_VEC;") == std::string::npos,
         "CUDA FlashAttention must not force all D=512 non-turbo attention onto the vector kernel; Gemma4 global layers need the MMA selector path");
