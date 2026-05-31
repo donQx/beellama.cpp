@@ -54,7 +54,7 @@ LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \
       org.opencontainers.image.title="BeeLlama.cpp" \
-      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash and TurboQuant" \
+      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
 

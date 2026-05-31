@@ -1,20 +1,13 @@
-name: Release
+name: Build Packages
 
 on:
   push:
+    branches:
+      - main
+      - "v*"
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version tag to use for artifact names, for example v0.3.0"
-        required: false
-        type: string
-      create_release:
-        description: "Create or update the GitHub release after artifacts build"
-        required: true
-        default: false
-        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,38 +18,53 @@ env:
 
 jobs:
   release-meta:
-    name: Release metadata
+    name: Package metadata
     runs-on: ubuntu-24.04
     outputs:
       tag_name: ${{ steps.meta.outputs.tag_name }}
       create_release: ${{ steps.meta.outputs.create_release }}
     steps:
-      - name: Resolve release inputs
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve package metadata
         id: meta
         shell: bash
-        env:
-          MANUAL_VERSION: ${{ inputs.version || '' }}
-          MANUAL_CREATE_RELEASE: ${{ inputs.create_release || 'false' }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/* ]]; then
+          short_sha="${GITHUB_SHA::12}"
+          ref_name_safe="${GITHUB_REF_NAME//\//-}"
+          exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
+          create_release="false"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             tag_name="${GITHUB_REF_NAME}"
-            create_release="true"
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
+            tag_name="${exact_tag}"
           else
-            tag_name="${MANUAL_VERSION:-${GITHUB_REF_NAME}}"
-            create_release="${MANUAL_CREATE_RELEASE}"
+            tag_name="${ref_name_safe}-${short_sha}"
           fi
 
-          if [[ "${create_release}" == "true" && ! "${tag_name}" =~ ^v[0-9]+(\.[0-9]+)*([.-].*)?$ ]]; then
-            echo "Release creation requires a version tag such as v0.3.0; got '${tag_name}'." >&2
-            exit 1
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              if git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+                create_release="true"
+              else
+                echo "Tag ${GITHUB_REF_NAME} is not on origin/main; building packages without publishing a release."
+              fi
+            elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
+              create_release="true"
+            fi
           fi
 
           echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "create_release=${create_release}" >> "${GITHUB_OUTPUT}"
-          echo "Using release tag: ${tag_name}"
-          echo "Create release: ${create_release}"
+          echo "Using package version: ${tag_name}"
+          echo "Publish GitHub release: ${create_release}"
 
   macos-arm64:
     name: macOS arm64 Metal
@@ -535,9 +543,8 @@ jobs:
           path: beellama-bin-win-hip-radeon-x64.zip
           name: beellama-bin-win-hip-radeon-x64.zip
 
-  release:
-    name: Publish GitHub release
-    if: ${{ needs.release-meta.outputs.create_release == 'true' }}
+  package-assets:
+    name: Assemble release assets
     needs:
       - release-meta
       - macos-arm64
@@ -548,8 +555,6 @@ jobs:
       - windows-cuda
       - windows-hip
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -637,13 +642,36 @@ jobs:
           - [Windows x64 (HIP)](${release_url}/beellama-${TAG_NAME}-bin-win-hip-radeon-x64.zip)
 
           **Docker:**
-          - \`${image_repo}:server-${TAG_NAME}\`
-          - \`${image_repo}:server-cpu-${TAG_NAME}\`
-          - \`${image_repo}:server-cuda-${TAG_NAME}\`
+          - \`${image_repo}:server-${TAG_NAME}\` / \`${image_repo}:server-cpu-${TAG_NAME}\` (CPU, linux/amd64 + linux/arm64; usable on Apple Silicon Docker Desktop without Metal acceleration)
+          - \`${image_repo}:server-cuda-${TAG_NAME}\` / \`${image_repo}:server-cuda12-${TAG_NAME}\`
           - \`${image_repo}:server-cuda13-${TAG_NAME}\`
           - \`${image_repo}:server-rocm-${TAG_NAME}\`
           - \`${image_repo}:server-vulkan-${TAG_NAME}\`
           EOF
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v6
+        with:
+          name: beellama-release-assets
+          path: |
+            release/*
+            release-notes.md
+
+  release:
+    name: Publish GitHub release
+    if: ${{ needs.release-meta.outputs.create_release == 'true' }}
+    needs:
+      - release-meta
+      - package-assets
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: beellama-release-assets
+          path: ./release-bundle
 
       - name: Create or update release
         env:
@@ -651,9 +679,21 @@ jobs:
           TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
         run: |
           set -euo pipefail
+          notes_file="$(find release-bundle -type f -name release-notes.md | head -n 1)"
+          if [[ -z "${notes_file}" ]]; then
+            echo "release-notes.md not found in release asset bundle" >&2
+            exit 1
+          fi
+
+          mapfile -t release_files < <(find release-bundle -type f ! -name release-notes.md | sort)
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "No release files found in release asset bundle" >&2
+            exit 1
+          fi
+
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" release/* --clobber
-            gh release edit "${TAG_NAME}" --title "${TAG_NAME}" --notes-file release-notes.md
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber
+            gh release edit "${TAG_NAME}" --title "${TAG_NAME}" --notes-file "${notes_file}"
           else
-            gh release create "${TAG_NAME}" release/* --title "${TAG_NAME}" --notes-file release-notes.md --verify-tag
+            gh release create "${TAG_NAME}" "${release_files[@]}" --title "${TAG_NAME}" --notes-file "${notes_file}" --verify-tag
           fi

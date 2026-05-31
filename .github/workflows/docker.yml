@@ -2,14 +2,10 @@ name: Publish Docker image
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version tag to use for Docker tags, for example v0.3.0"
-        required: false
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,19 +22,36 @@ jobs:
     outputs:
       image_repo: ${{ steps.meta.outputs.image_repo }}
       version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
     steps:
+      - name: Check out the repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Resolve image metadata
         id: meta
         shell: bash
-        env:
-          MANUAL_VERSION: ${{ inputs.version || '' }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/* ]]; then
+          publish="false"
+          short_sha="${GITHUB_SHA::12}"
+          exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME}"
+            git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
+            if git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+              publish="true"
+            else
+              echo "Tag ${GITHUB_REF_NAME} is not on origin/main; skipping Docker publish."
+            fi
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
+            version="${exact_tag}"
+            publish="true"
           else
-            version="${MANUAL_VERSION:-${GITHUB_REF_NAME}}"
+            version="${GITHUB_REF_NAME//\//-}-${short_sha}"
           fi
 
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
@@ -47,50 +60,66 @@ jobs:
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
           echo "Using image repository: ${image_repo}"
           echo "Using version: ${version}"
+          echo "Publish Docker images: ${publish}"
 
   build:
-    name: Build ${{ matrix.target }}${{ matrix.config.display_suffix }}
+    name: Build server${{ matrix.config.display_suffix }}
     needs: docker-meta
+    if: ${{ needs.docker-meta.outputs.publish == 'true' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        target: ["full", "light", "server"]
         config:
           - name: cpu
             display_suffix: " CPU"
             dockerfile: .devops/cpu.Dockerfile
             tag_suffixes: "none -cpu"
+            cache_name: cpu
+            platforms: linux/amd64,linux/arm64
             free_disk_space: false
           - name: cuda12
             display_suffix: " CUDA 12"
             dockerfile: .devops/cuda.Dockerfile
             cuda_version: "12.8.1"
             tag_suffixes: "-cuda -cuda12"
+            cache_name: cuda12
+            platforms: linux/amd64
             free_disk_space: true
           - name: cuda13
             display_suffix: " CUDA 13"
             dockerfile: .devops/cuda.Dockerfile
             cuda_version: "13.1.1"
             tag_suffixes: "-cuda13"
+            cache_name: cuda13
+            platforms: linux/amd64
             free_disk_space: true
           - name: rocm
             display_suffix: " ROCm"
             dockerfile: .devops/rocm.Dockerfile
             tag_suffixes: "-rocm"
+            cache_name: rocm
+            platforms: linux/amd64
             free_disk_space: true
           - name: vulkan
             display_suffix: " Vulkan"
             dockerfile: .devops/vulkan.Dockerfile
             tag_suffixes: "-vulkan"
+            cache_name: vulkan
+            platforms: linux/amd64
             free_disk_space: false
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Set up QEMU
+        if: ${{ contains(matrix.config.platforms, 'linux/arm64') }}
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
@@ -124,8 +153,8 @@ jobs:
         env:
           IMAGE_REPO: ${{ needs.docker-meta.outputs.image_repo }}
           VERSION: ${{ needs.docker-meta.outputs.version }}
-          TARGET: ${{ matrix.target }}
           TAG_SUFFIXES: ${{ matrix.config.tag_suffixes }}
+          CACHE_NAME: ${{ matrix.config.cache_name }}
         run: |
           set -euo pipefail
 
@@ -134,18 +163,15 @@ jobs:
             if [[ "${suffix}" == "none" ]]; then
               suffix=""
             fi
-            tags+=("${IMAGE_REPO}:${TARGET}${suffix}")
-            tags+=("${IMAGE_REPO}:${TARGET}${suffix}-${VERSION}")
+            tags+=("${IMAGE_REPO}:server${suffix}")
+            tags+=("${IMAGE_REPO}:server${suffix}-${VERSION}")
           done
-
-          cache_suffix="${TAG_SUFFIXES// /_}"
-          cache_suffix="${cache_suffix//none/cpu}"
 
           {
             echo "tags<<EOF"
             printf '%s\n' "${tags[@]}"
             echo "EOF"
-            echo "cache_tag=${IMAGE_REPO}:buildcache-${TARGET}-${cache_suffix}-amd64"
+            echo "cache_tag=${IMAGE_REPO}:buildcache-server-${CACHE_NAME}"
           } >> "${GITHUB_OUTPUT}"
 
           printf 'Publishing tags:\n'
@@ -155,9 +181,9 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: ${{ matrix.config.platforms }}
           file: ${{ matrix.config.dockerfile }}
-          target: ${{ matrix.target }}
+          target: server
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           provenance: false
