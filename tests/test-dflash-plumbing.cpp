@@ -209,17 +209,17 @@ int main(int argc, char ** argv) {
 
     {
         const size_t shared_gate = server_context.find("bool dflash_shared_drafter_batch_allowed");
-        const size_t opt_in_env = server_context.find("GGML_DFLASH_SHARED_DRAFT_BATCH");
-        const size_t opt_in_check = server_context.find("dflash_shared_drafter_batch_enabled()", shared_gate);
+        const size_t opt_out_env = server_context.find("GGML_DFLASH_SHARED_DRAFT_BATCH");
+        const size_t opt_out_check = server_context.find("dflash_shared_drafter_batch_disabled()", shared_gate);
         const size_t draft_batch_call = server_context.find("common_speculative_draft_batch", shared_gate);
 
         ok &= expect(shared_gate != std::string::npos &&
-                     opt_in_env != std::string::npos &&
-                     opt_in_check != std::string::npos &&
+                     opt_out_env != std::string::npos &&
+                     opt_out_check != std::string::npos &&
                      draft_batch_call != std::string::npos &&
-                     shared_gate < opt_in_check &&
-                     opt_in_check < draft_batch_call,
-            "flat DFlash shared drafter batching must be explicit opt-in because the multi-slot graph disables the single-slot K/V cache");
+                     shared_gate < opt_out_check &&
+                     opt_out_check < draft_batch_call,
+            "flat DFlash shared drafter batching must be default-enabled with GGML_DFLASH_SHARED_DRAFT_BATCH=0 as the fallback kill switch");
     }
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
@@ -500,25 +500,33 @@ int main(int argc, char ** argv) {
                  context_cpp.find("void llama_context::dflash_kv_cache_set_active_seq") != std::string::npos &&
                  context_cpp.find("dflash_kv_cache_active_seq = seq_id;") != std::string::npos,
         "DFlash drafter K/V projection caches must be keyed by logical seq so concurrent slots cannot share one cache");
-    ok &= expect(context_cpp.find("bool llama_context::dflash_kv_cache_prepare_batch") == std::string::npos &&
-                 speculative.find("llama_dflash_kv_cache_prepare_batch") == std::string::npos &&
-                 llama_h.find("llama_dflash_kv_cache_prepare_batch") == std::string::npos,
-        "DFlash shared multi-slot drafts must not expose a single-slot K/V projection cache as a shared batch cache");
+    {
+        const size_t prepare_batch_fn = context_cpp.find("bool llama_context::dflash_kv_cache_prepare_batch");
+        ok &= expect(prepare_batch_fn != std::string::npos &&
+                     context_h.find("dflash_kv_cache_batch") != std::string::npos &&
+                     context_h.find("bool dflash_kv_cache_prepare_batch") != std::string::npos &&
+                     llama_h.find("llama_dflash_kv_cache_prepare_batch") != std::string::npos &&
+                     context_cpp.find("cross.dflash_kv_cache = &dflash_kv_cache_batch.view", prepare_batch_fn) != std::string::npos,
+            "DFlash shared multi-slot drafts must expose a composite slot-owned K/V projection cache, not the active single-slot cache");
+    }
     {
         const size_t batch_fn = speculative.find("void common_speculative_draft_batch");
         const size_t prewidth = speculative.find("llama_set_dflash_n_slots(ctx_dft, std::max", batch_fn);
         const size_t prepare = speculative.find("prepare_batch_draft(ctx_dft)", batch_fn);
         const size_t readywidth = speculative.find("llama_set_dflash_n_slots(ctx_dft, n_ready)", batch_fn);
+        const size_t cache_prepare = speculative.find("llama_dflash_kv_cache_prepare_batch(ctx_dft", readywidth);
         const size_t decode = speculative.find("llama_decode(ctx_dft, batch)", batch_fn);
         ok &= expect(batch_fn != std::string::npos &&
                      prewidth != std::string::npos &&
                      prepare != std::string::npos &&
                      readywidth != std::string::npos &&
+                     cache_prepare != std::string::npos &&
                      decode != std::string::npos &&
                      prewidth < prepare &&
                      prepare < readywidth &&
-                     readywidth < decode,
-            "DFlash shared drafter must enter multi-slot mode before preparing cross data, then narrow to the actual ready slot count before decode");
+                     readywidth < cache_prepare &&
+                     cache_prepare < decode,
+            "DFlash shared drafter must enter multi-slot mode before preparing cross data, then expose a batched K/V cache before decode");
     }
     ok &= expect(context_h.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
                  llama_h.find("llama_dflash_target_kv_cache_update_from_ring") != std::string::npos &&
@@ -1775,6 +1783,17 @@ int main(int argc, char ** argv) {
                  server_adaptive_dm_h.find("profit_acceptance_collapse_disabled") == std::string::npos &&
                  server_adaptive_dm_h.find("disabling DFlash for request after sustained low acceptance") == std::string::npos,
         "DFlash adaptive DM must not hard-disable request-local DFlash capture/update state from low acceptance alone");
+    {
+        const size_t multi_profit = server_context.find("dflash_profit_shared_scale");
+        const size_t observe = server_context.find("slot.observe_profit_timing", multi_profit);
+        const size_t decide = server_context.find("apply_profit_decision(slot)", observe);
+        ok &= expect(multi_profit != std::string::npos &&
+                     server_context.find("n_slots_drafted > 1", multi_profit) < observe &&
+                     observe != std::string::npos &&
+                     decide != std::string::npos &&
+                     observe < decide,
+            "DFlash profit telemetry must observe multi-slot cycles instead of clearing pending samples when -np > 1");
+    }
     ok &= expect(context_cpp.find("const size_t total_ids = (size_t) K * (size_t) n_outputs_all") != std::string::npos &&
                  context_cpp.find("const size_t offset_ids = (size_t) K * (size_t) n_outputs_prev") != std::string::npos &&
                  context_cpp.find("logits_argmax_count = (int32_t) (n_outputs_prev + n_outputs)") != std::string::npos,

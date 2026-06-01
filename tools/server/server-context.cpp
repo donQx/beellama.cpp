@@ -68,12 +68,12 @@ static bool dflash_verify_padding_enabled() {
     return enabled;
 }
 
-static bool dflash_shared_drafter_batch_enabled() {
-    static const bool enabled = [] {
+static bool dflash_shared_drafter_batch_disabled() {
+    static const bool disabled = [] {
         const char * env = getenv("GGML_DFLASH_SHARED_DRAFT_BATCH");
-        return env && env[0] != '\0' && strcmp(env, "0") != 0;
+        return env && env[0] != '\0' && strcmp(env, "0") == 0;
     }();
-    return enabled;
+    return disabled;
 }
 
 static bool server_model_is_dflash_drafter(const llama_model * model) {
@@ -1989,7 +1989,7 @@ private:
     }
 
     bool dflash_shared_drafter_batch_allowed(int n_drafting) {
-        if (!dflash_shared_drafter_batch_enabled()) {
+        if (dflash_shared_drafter_batch_disabled()) {
             return false;
         }
         if (n_drafting < 2) {
@@ -4345,6 +4345,7 @@ private:
                         params_base.speculative, batch_id_lasts, batch_results,
                         use_rejection_sampling ? &batch_log_probs : nullptr);
                 t_draft_total = ggml_time_us() - t_batch_start;
+                llama_set_dflash_n_slots(ctx_dft_shared.get(), 1);
 
                 for (size_t i = 0; i < batch_slot_ids.size(); i++) {
                     batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
@@ -6884,29 +6885,36 @@ private:
             }
         };
 
-        if (pure_tg_cycle && n_slots_drafted == 1) {
+        if (pure_tg_cycle && n_slots_drafted > 0) {
             const int64_t t_cycle_total_now = ggml_time_us() - t_cycle_start;
+            const float dflash_profit_shared_scale = n_slots_drafted > 1 ? 1.0f / (float) n_slots_drafted : 1.0f;
             for (auto & slot : slots) {
                 if (!slot.profit_pending || slot.profit_pending_tree || !slot.task) {
                     continue;
                 }
 
+                const float draft_ms  = (t_draft_total / 1000.0f) * dflash_profit_shared_scale;
+                const float verify_ms = (t_verify_total / 1000.0f) * dflash_profit_shared_scale;
+                const float accept_ms = (t_accept_total / 1000.0f) * dflash_profit_shared_scale;
+                const float cycle_ms  = (t_cycle_total_now / 1000.0f) * dflash_profit_shared_scale;
+
                 slot.observe_profit_timing(
                         slot.profit_pending_n_draft,
-                        t_draft_total / 1000.0f,
-                        t_verify_total / 1000.0f,
-                        t_accept_total / 1000.0f,
-                        t_cycle_total_now / 1000.0f);
+                        draft_ms,
+                        verify_ms,
+                        accept_ms,
+                        cycle_ms);
 
                 LOG_DBG("profit telemetry: n_draft=%d n_accepted=%d "
                         "draft_ms=%.1f verify_ms=%.1f accept_ms=%.1f cycle_ms=%.1f "
-                        "n_encoded=%d\n",
+                        "shared_scale=%.3f n_encoded=%d\n",
                         slot.profit_pending_n_draft,
                         slot.profit_pending_n_accepted,
-                        t_draft_total / 1000.0,
-                        t_verify_total / 1000.0,
-                        t_accept_total / 1000.0,
-                        t_cycle_total_now / 1000.0,
+                        (double) draft_ms,
+                        (double) verify_ms,
+                        (double) accept_ms,
+                        (double) cycle_ms,
+                        (double) dflash_profit_shared_scale,
                         slot.n_decoded);
 
                 apply_profit_decision(slot);

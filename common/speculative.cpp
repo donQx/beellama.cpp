@@ -4581,9 +4581,31 @@ void common_speculative_draft_batch(
 
     llama_set_dflash_n_slots(ctx_dft, n_ready);
 
+    std::vector<llama_seq_id> ready_seq_ids;
+    ready_seq_ids.reserve(n_ready);
     for (const auto & rs : ready) {
+        ready_seq_ids.push_back(rs.seq_id);
         llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);
         common_dflash_align_drafter_seq_or_clear(ctx_dft, rs.seq_id, rs.draft_pos_base, "batched draft");
+    }
+
+    if (n_ready > 1) {
+        const int ctx_window = params.dflash_cross_ctx > 0 ? params.dflash_cross_ctx : (int) LLAMA_DFLASH_PER_SLOT_CTX;
+        if (!llama_dflash_kv_cache_prepare_batch(ctx_dft, ready_seq_ids.data(), n_ready, ctx_window)) {
+            static bool warned_batch_kv = false;
+            if (!warned_batch_kv) {
+                LOG_WRN("dflash batch: batched K/V projection cache unavailable; falling back to per-slot cached drafting\n");
+                warned_batch_kv = true;
+            }
+            llama_set_dflash_n_slots(ctx_dft, 1);
+            return;
+        }
+        static bool logged_batch_kv = false;
+        if (!logged_batch_kv) {
+            LOG_INF("dflash: shared batched K/V projection cache enabled (%d slots, %d-token window)\n",
+                    n_ready, ctx_window);
+            logged_batch_kv = true;
+        }
     }
 
     const int64_t t1 = ggml_time_us();

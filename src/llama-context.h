@@ -436,6 +436,41 @@ struct dflash_kv_cache_data {
         }
     }
 };
+
+struct dflash_kv_cache_batch_data {
+    llama_dflash_kv_cache_view view;
+
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+
+    std::vector<ggml_tensor *> k_ring;
+    std::vector<ggml_tensor *> v_ring;
+
+    int n_slots = 0;
+    int ctx_window = 0;
+    int n_elem = 0;
+
+    void reset() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        view = {};
+        k_ring.clear();
+        v_ring.clear();
+        n_slots = 0;
+        ctx_window = 0;
+        n_elem = 0;
+    }
+
+    ~dflash_kv_cache_batch_data() {
+        reset();
+    }
+};
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -740,6 +775,7 @@ public:
     bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
     bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
     bool dflash_kv_cache_prepare(int ctx_window);
+    bool dflash_kv_cache_prepare_batch(const llama_seq_id * seq_ids, int n_seq, int ctx_window);
     dflash_kv_cache_data * dflash_kv_cache_active();
     void dflash_kv_cache_set_active_seq(llama_seq_id seq_id);
     std::unique_ptr<dflash_kv_cache_data> & dflash_kv_cache_active_ref();
@@ -920,6 +956,7 @@ private:
     bool dflash_kv_cache_multi_gpu_fallback_logged = false;
     llama_seq_id dflash_kv_cache_active_seq = -1;
     std::map<llama_seq_id, std::unique_ptr<dflash_kv_cache_data>> dflash_kv_caches;
+    dflash_kv_cache_batch_data dflash_kv_cache_batch;
 
     bool dflash_capture_valid_last_decode = true;
     std::string dflash_capture_invalid_reason;

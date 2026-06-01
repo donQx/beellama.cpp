@@ -1274,6 +1274,11 @@ extern "C" {
             int ring_write_pos, int ring_filled,
             int n_layers, int n_embd, int n_tokens,
             llama_seq_id seq_id);
+    LLAMA_API bool   llama_dflash_kv_cache_prepare_batch(
+            struct llama_context * ctx,
+            const llama_seq_id * seq_ids,
+            int n_seq,
+            int ctx_window);
     LLAMA_API bool   llama_dflash_target_kv_cache_update_from_ring(
             struct llama_context * ctx, void * handle,
             int ring_write_pos, int ring_filled,

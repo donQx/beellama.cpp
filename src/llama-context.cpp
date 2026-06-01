@@ -4296,6 +4296,209 @@ bool llama_context::dflash_kv_cache_prepare(int ctx_window) {
     return true;
 }
 
+bool llama_context::dflash_kv_cache_prepare_batch(const llama_seq_id * seq_ids, int n_seq, int ctx_window) {
+    cross.dflash_kv_cache = nullptr;
+
+    if (!seq_ids || n_seq < 2 || n_seq > (int) LLAMA_DFLASH_MAX_SLOTS ||
+            ctx_window <= 0 || !llm_arch_is_dflash_drafter(model.arch)) {
+        return false;
+    }
+    if (model.n_devices() > 1) {
+        return false;
+    }
+
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+    if (!gpu_backend) {
+        return false;
+    }
+
+    struct batch_slot_cache {
+        dflash_kv_cache_data * cache = nullptr;
+        int n_copy = 0;
+        int src_offset = 0;
+    };
+
+    std::vector<batch_slot_cache> slot_caches;
+    slot_caches.reserve(n_seq);
+
+    int n_layers = 0;
+    int64_t n_embd_head = 0;
+    int64_t n_head_kv = 0;
+    int n_elem = 0;
+
+    for (int s = 0; s < n_seq; ++s) {
+        const llama_seq_id seq_id = seq_ids[s];
+        auto cache_it = dflash_kv_caches.find(seq_id);
+        if (cache_it == dflash_kv_caches.end() || !cache_it->second) {
+            return false;
+        }
+        auto * cache = cache_it->second.get();
+
+        auto cross_it = cross.v_embd_per_seq.find(seq_id);
+        if (cross_it == cross.v_embd_per_seq.end()) {
+            return false;
+        }
+        const int64_t cross_real = cross_it->second.v_embd_gpu
+            ? cross_it->second.v_embd_gpu_n_enc_real
+            : cross_it->second.n_enc_real;
+        const int n_needed = (int) std::min<int64_t>(std::max<int64_t>(cross_real, 0), ctx_window);
+
+        if (n_needed <= 0 ||
+                cache->ring_size < ctx_window ||
+                cache->n_filled < n_needed ||
+                cache->write_pos != 0 ||
+                cache->n_elem <= 0 ||
+                !cache->fn_copy_d2d ||
+                cache->view.n_layers <= 0 ||
+                (int) cache->k_ring.size() < cache->view.n_layers ||
+                (int) cache->v_ring.size() < cache->view.n_layers) {
+            return false;
+        }
+
+        if (s == 0) {
+            n_layers = cache->view.n_layers;
+            n_embd_head = cache->view.n_embd_head;
+            n_head_kv = cache->view.n_head_kv;
+            n_elem = cache->n_elem;
+        } else if (n_layers != cache->view.n_layers ||
+                n_embd_head != cache->view.n_embd_head ||
+                n_head_kv != cache->view.n_head_kv ||
+                n_elem != cache->n_elem) {
+            return false;
+        }
+
+        for (int il = 0; il < n_layers; ++il) {
+            if (!cache->k_ring[il] || !cache->v_ring[il]) {
+                return false;
+            }
+        }
+
+        slot_caches.push_back({ cache, n_needed, cache->n_filled - n_needed });
+    }
+
+    if (n_layers <= 0 || n_elem <= 0 || n_embd_head <= 0 || n_head_kv <= 0) {
+        return false;
+    }
+
+    const int total_ctx = n_seq * ctx_window;
+    const bool reuse_batch =
+        dflash_kv_cache_batch.ctx != nullptr &&
+        dflash_kv_cache_batch.buf != nullptr &&
+        dflash_kv_cache_batch.n_slots == n_seq &&
+        dflash_kv_cache_batch.ctx_window == ctx_window &&
+        dflash_kv_cache_batch.n_elem == n_elem &&
+        dflash_kv_cache_batch.view.n_layers == n_layers &&
+        dflash_kv_cache_batch.view.n_embd_head == n_embd_head &&
+        dflash_kv_cache_batch.view.n_head_kv == n_head_kv &&
+        dflash_kv_cache_batch.view.ctx_len == total_ctx;
+
+    if (!reuse_batch) {
+        dflash_kv_cache_batch.reset();
+
+        const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_layers * 2 + 8);
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        ggml_context * batch_ctx = ggml_init(ctx_params);
+        if (!batch_ctx) {
+            return false;
+        }
+
+        dflash_kv_cache_batch.ctx = batch_ctx;
+        dflash_kv_cache_batch.n_slots = n_seq;
+        dflash_kv_cache_batch.ctx_window = ctx_window;
+        dflash_kv_cache_batch.n_elem = n_elem;
+        dflash_kv_cache_batch.view.n_layers = n_layers;
+        dflash_kv_cache_batch.view.n_embd_head = n_embd_head;
+        dflash_kv_cache_batch.view.n_head_kv = n_head_kv;
+        dflash_kv_cache_batch.view.ctx_len = total_ctx;
+        dflash_kv_cache_batch.view.ring_size = total_ctx;
+        dflash_kv_cache_batch.k_ring.resize(n_layers);
+        dflash_kv_cache_batch.v_ring.resize(n_layers);
+        dflash_kv_cache_batch.view.k_ring.resize(n_layers);
+        dflash_kv_cache_batch.view.v_ring.resize(n_layers);
+
+        for (int il = 0; il < n_layers; ++il) {
+            dflash_kv_cache_batch.k_ring[il] =
+                ggml_new_tensor_3d(batch_ctx, GGML_TYPE_F32, n_embd_head, n_head_kv, total_ctx);
+            dflash_kv_cache_batch.v_ring[il] =
+                ggml_new_tensor_3d(batch_ctx, GGML_TYPE_F32, n_embd_head, n_head_kv, total_ctx);
+            dflash_kv_cache_batch.view.k_ring[il] = dflash_kv_cache_batch.k_ring[il];
+            dflash_kv_cache_batch.view.v_ring[il] = dflash_kv_cache_batch.v_ring[il];
+        }
+
+        dflash_kv_cache_batch.buf = ggml_backend_alloc_ctx_tensors(batch_ctx, gpu_backend);
+        if (!dflash_kv_cache_batch.buf) {
+            dflash_kv_cache_batch.reset();
+            return false;
+        }
+
+        for (int il = 0; il < n_layers; ++il) {
+            ggml_backend_tensor_memset(dflash_kv_cache_batch.k_ring[il], 0, 0, ggml_nbytes(dflash_kv_cache_batch.k_ring[il]));
+            ggml_backend_tensor_memset(dflash_kv_cache_batch.v_ring[il], 0, 0, ggml_nbytes(dflash_kv_cache_batch.v_ring[il]));
+        }
+        ggml_backend_synchronize(gpu_backend);
+
+        const size_t total_size = ggml_backend_buffer_get_size(dflash_kv_cache_batch.buf);
+        LLAMA_LOG_INFO("%s: allocated DFlash batched K/V cache: %.1f MB (%d slots, %d tokens/slot, %d layers, %d elems/token)\n",
+            __func__, total_size / (1024.0 * 1024.0), n_seq, ctx_window, n_layers, n_elem);
+    }
+
+    const size_t stride = (size_t) n_elem * sizeof(float);
+    for (int s = 0; s < n_seq; ++s) {
+        auto * cache = slot_caches[s].cache;
+        const int n_copy = slot_caches[s].n_copy;
+        const int src_offset = slot_caches[s].src_offset;
+        const size_t bytes = (size_t) n_copy * stride;
+        const size_t dst_offset = (size_t) s * (size_t) ctx_window * stride;
+
+        for (int il = 0; il < n_layers; ++il) {
+            auto copy_tensor = [&](ggml_tensor * dst_tensor, const ggml_tensor * src_tensor) -> bool {
+                char * dst = (char *) dst_tensor->data + dst_offset;
+                const char * src = (const char *) src_tensor->data + (size_t) src_offset * stride;
+                const bool fast_copy =
+                    cache->fn_copy_d2d_no_check &&
+                    cache->fn_prepare_ptr &&
+                    cache->fn_prepare_ptr(dst) &&
+                    cache->fn_prepare_ptr(src);
+                const auto fn_copy = fast_copy ? cache->fn_copy_d2d_no_check : cache->fn_copy_d2d;
+                return fn_copy && fn_copy(dst, src, bytes);
+            };
+
+            if (!copy_tensor(dflash_kv_cache_batch.k_ring[il], cache->k_ring[il]) ||
+                    !copy_tensor(dflash_kv_cache_batch.v_ring[il], cache->v_ring[il])) {
+                cross.dflash_kv_cache = nullptr;
+                return false;
+            }
+        }
+    }
+
+    auto * sync_cache = slot_caches.empty() ? nullptr : slot_caches[0].cache;
+    if (sync_cache && sync_cache->fn_wait_dflash_stream) {
+        if (!sync_cache->fn_wait_dflash_stream(gpu_backend)) {
+            cross.dflash_kv_cache = nullptr;
+            return false;
+        }
+    } else if (sync_cache && sync_cache->fn_sync_ptr && !dflash_kv_cache_batch.k_ring.empty()) {
+        if (!sync_cache->fn_sync_ptr(dflash_kv_cache_batch.k_ring[0]->data)) {
+            cross.dflash_kv_cache = nullptr;
+            return false;
+        }
+    } else {
+        ggml_backend_synchronize(gpu_backend);
+    }
+
+    dflash_kv_cache_batch.view.n_filled = total_ctx;
+    dflash_kv_cache_batch.view.write_pos = 0;
+    cross.dflash_kv_cache = &dflash_kv_cache_batch.view;
+    return true;
+}
+
 bool llama_context::dflash_kv_cache_update(int n_tokens) {
     dflash_kv_cache_data * dflash_kv_cache = dflash_kv_cache_active();
     if (!dflash_kv_cache || n_tokens <= 0 || !llm_arch_is_dflash_drafter(model.arch)) {
@@ -8753,6 +8956,15 @@ bool llama_dflash_kv_cache_update_from_ring_seq(
     ctx->dflash_kv_cache_set_active_seq(seq_id);
     return llama_dflash_kv_cache_update_from_ring(
         ctx, handle, ring_write_pos, ring_filled, n_layers, n_embd, n_tokens);
+}
+
+bool llama_dflash_kv_cache_prepare_batch(
+        llama_context * ctx,
+        const llama_seq_id * seq_ids,
+        int n_seq,
+        int ctx_window) {
+    if (!ctx) return false;
+    return ctx->dflash_kv_cache_prepare_batch(seq_ids, n_seq, ctx_window);
 }
 
 bool llama_dflash_target_kv_cache_update_from_ring(
