@@ -325,6 +325,106 @@ jobs:
           path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-rocm-7.2-x64.tar.gz
           name: beellama-bin-ubuntu-rocm-7.2-x64.tar.gz
 
+  ubuntu-sycl:
+    name: Ubuntu x64 SYCL
+    needs: release-meta
+    runs-on: ubuntu-24.04
+    env:
+      ONEAPI_ROOT: /opt/intel/oneapi
+      ONEAPI_INSTALLER_VERSION: "2025.3.3"
+      ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh
+      LEVEL_ZERO_VERSION: "1.28.2"
+      LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Free up disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Prepare oneAPI cache path
+        run: |
+          sudo mkdir -p "${ONEAPI_ROOT}"
+          sudo chown -R "${USER}:${USER}" /opt/intel
+
+      - name: Cache oneAPI installation
+        id: cache-oneapi
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.ONEAPI_ROOT }}
+          key: oneapi-linux-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake ninja-build wget ca-certificates libssl-dev
+
+      - name: Install oneAPI
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        run: |
+          installer="${RUNNER_TEMP}/intel-deep-learning-essentials-${ONEAPI_INSTALLER_VERSION}.sh"
+          wget "${ONEAPI_INSTALLER_URL}" -O "${installer}"
+          sudo bash "${installer}" -s -a --silent --eula accept
+          sudo chown -R "${USER}:${USER}" "${ONEAPI_ROOT}"
+
+      - name: Install Level Zero SDK
+        run: |
+          cd /tmp
+          wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb
+          wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
+          sudo apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb
+
+      - name: Build
+        run: |
+          source "${ONEAPI_ROOT}/setvars.sh"
+          cmake -B build -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_SYCL=ON \
+            -DGGML_SYCL_F16=OFF \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j "$(nproc)"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf "beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-sycl-x64.tar.gz" \
+            --transform "s,^\.,beellama-${{ needs.release-meta.outputs.tag_name }}," \
+            -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-sycl-x64.tar.gz
+          name: beellama-bin-ubuntu-sycl-x64.tar.gz
+
   windows-cpu:
     name: Windows x64 CPU
     needs: release-meta
@@ -387,6 +487,130 @@ jobs:
         with:
           path: beellama-bin-win-cpu-x64.zip
           name: beellama-bin-win-cpu-x64.zip
+
+  windows-sycl:
+    name: Windows x64 SYCL
+    needs: release-meta
+    runs-on: windows-2022
+    env:
+      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
+      WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+      LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
+      ONEAPI_ROOT: 'C:\Program Files (x86)\Intel\oneAPI'
+      ONEAPI_INSTALLER_VERSION: "2025.3.3"
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Cache oneAPI installation
+        id: cache-oneapi
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.ONEAPI_ROOT }}
+          key: oneapi-windows-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: Install oneAPI
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        shell: cmd
+        run: scripts\install-oneapi.bat "%WINDOWS_BASEKIT_URL%" "%WINDOWS_DPCPP_MKL%"
+
+      - name: Install Level Zero SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "level-zero-win-sdk.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "level-zero-sdk"
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $extractDir -Force
+          $sdkRoot = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
+          if (-not $sdkRoot) {
+            $sdkRoot = Get-Item $extractDir
+          }
+          "LEVEL_ZERO_V1_SDK_PATH=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%ONEAPI_ROOT%\setvars.bat" intel64 --force
+          icx --version
+          cmake -G "Ninja" -B build ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_BACKEND_DL=ON ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DGGML_CPU=OFF ^
+            -DGGML_SYCL=ON ^
+            -DGGML_SYCL_F16=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=OFF ^
+            -DLLAMA_BUILD_SERVER=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-sycl
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      - name: Pack SYCL backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = ".\build\bin"
+          Copy-Item ".\LICENSE" $bin -Force
+
+          $runtimeFiles = @(
+            "$env:ONEAPI_ROOT\mkl\latest\bin\mkl_sycl_blas.5.dll",
+            "$env:ONEAPI_ROOT\mkl\latest\bin\mkl_core.2.dll",
+            "$env:ONEAPI_ROOT\mkl\latest\bin\mkl_tbb_thread.2.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\ur_adapter_level_zero.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\ur_adapter_level_zero_v2.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\ur_adapter_opencl.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\ur_loader.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\ur_win_proxy_loader.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\sycl8.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\svml_dispmd.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\libmmd.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\libiomp5md.dll",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\sycl-ls.exe",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\libsycl-fallback-bfloat16.spv",
+            "$env:ONEAPI_ROOT\compiler\latest\bin\libsycl-native-bfloat16.spv",
+            "$env:ONEAPI_ROOT\dnnl\latest\bin\dnnl.dll",
+            "$env:ONEAPI_ROOT\tbb\latest\bin\tbb12.dll",
+            "$env:ONEAPI_ROOT\tcm\latest\bin\tcm.dll",
+            "$env:ONEAPI_ROOT\tcm\latest\bin\libhwloc-15.dll",
+            "$env:ONEAPI_ROOT\umf\latest\bin\umf.dll"
+          )
+
+          foreach ($file in $runtimeFiles) {
+            Copy-Item -LiteralPath $file -Destination $bin -Force
+          }
+
+          $zeLoader = Get-ChildItem -Path @($env:ONEAPI_ROOT, $env:LEVEL_ZERO_V1_SDK_PATH) -Recurse -Filter "ze_loader.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zeLoader) {
+            Copy-Item -LiteralPath $zeLoader.FullName -Destination $bin -Force
+          } else {
+            Write-Warning "ze_loader.dll was not found in oneAPI or the Level Zero SDK; relying on the system driver runtime"
+          }
+
+          7z a -snl "beellama-bin-win-sycl-x64.zip" "$bin\*"
+
+      - name: Upload SYCL backend
+        uses: actions/upload-artifact@v6
+        with:
+          path: beellama-bin-win-sycl-x64.zip
+          name: beellama-bin-win-sycl-x64.zip
 
   windows-cuda:
     name: Windows x64 CUDA ${{ matrix.cuda }}
@@ -579,7 +803,9 @@ jobs:
       - ubuntu-cpu
       - ubuntu-vulkan
       - ubuntu-rocm
+      - ubuntu-sycl
       - windows-cpu
+      - windows-sycl
       - windows-cuda
       - windows-hip
     runs-on: ubuntu-24.04
@@ -662,9 +888,11 @@ jobs:
           - [Ubuntu x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-x64.tar.gz)
           - [Ubuntu x64 (Vulkan)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-vulkan-x64.tar.gz)
           - [Ubuntu x64 (ROCm 7.2)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-rocm-7.2-x64.tar.gz)
+          - [Ubuntu x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-sycl-x64.tar.gz)
 
           **Windows:**
           - [Windows x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-win-cpu-x64.zip)
+          - [Windows x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-win-sycl-x64.zip)
           - [Windows x64 (CUDA 12)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-12.4-x64.zip)
           - [Windows x64 (CUDA 13)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-13.1-x64.zip) - [CUDA 13.1 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-13.1-x64.zip)
           - [Windows x64 (HIP)](${release_url}/beellama-${TAG_NAME}-bin-win-hip-radeon-x64.zip)
@@ -675,6 +903,7 @@ jobs:
           - \`${image_repo}:server-cuda13-${TAG_NAME}\`
           - \`${image_repo}:server-rocm-${TAG_NAME}\`
           - \`${image_repo}:server-vulkan-${TAG_NAME}\`
+          - \`${image_repo}:server-sycl-${TAG_NAME}\`
           EOF
 
       - name: Upload release assets

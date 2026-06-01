@@ -8,6 +8,7 @@ ARG APP_REVISION=N/A
 FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 
 ARG GGML_SYCL_F16=OFF
+ARG SYCL_BUILD_TARGET=all
 ARG LEVEL_ZERO_VERSION=1.28.2
 ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
 RUN apt-get update && \
@@ -27,8 +28,21 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
     fi && \
     echo "Building with dynamic libs" && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
-    cmake --build build --config Release -j$(nproc)
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DGGML_SYCL=ON \
+        -DCMAKE_C_COMPILER=icx \
+        -DCMAKE_CXX_COMPILER=icpx \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU_ALL_VARIANTS=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_TOOLS=ON \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DGGML_RPC=ON \
+        ${OPT_SYCL_F16} && \
+    cmake --build build --config Release -j$(nproc) --target ${SYCL_BUILD_TARGET}
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -47,13 +61,13 @@ FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS base
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
-ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_URL=https://github.com/Anbeeld/beellama.cpp
+ARG IMAGE_SOURCE=https://github.com/Anbeeld/beellama.cpp
 LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.title="llama.cpp" \
-      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.title="BeeLlama.cpp" \
+      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
 

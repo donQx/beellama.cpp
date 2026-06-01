@@ -139,6 +139,14 @@ jobs:
             cache_name: vulkan
             platforms: linux/amd64
             free_disk_space: false
+          - name: sycl
+            display_suffix: " SYCL"
+            dockerfile: .devops/intel.Dockerfile
+            sycl_build_target: "llama-server"
+            tag_suffixes: "-sycl"
+            cache_name: sycl
+            platforms: linux/amd64
+            free_disk_space: true
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
@@ -234,6 +242,7 @@ jobs:
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
             ${{ matrix.config.cuda_arch && format('CUDA_DOCKER_ARCH={0}', matrix.config.cuda_arch) || '' }}
             ${{ matrix.config.cuda_build_target && format('CUDA_BUILD_TARGET={0}', matrix.config.cuda_build_target) || '' }}
+            ${{ matrix.config.sycl_build_target && format('SYCL_BUILD_TARGET={0}', matrix.config.sycl_build_target) || '' }}
           annotations: |
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.docker-meta.outputs.version }}
