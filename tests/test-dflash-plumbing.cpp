@@ -1828,14 +1828,29 @@ int main(int argc, char ** argv) {
     }
     {
         const size_t rollback_call = server_context.find("llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);");
-        const size_t rollback_sync = server_context.find("llama_tape_replay_sync(ctx_tgt);", rollback_call);
+        const size_t rollback_guard = server_context.find("if (n_slots_drafted > 1)", rollback_call);
+        const size_t rollback_sync = server_context.find("llama_tape_replay_sync(ctx_tgt);", rollback_guard);
         const size_t next_accept_lap = server_context.find("profile_accept_lap(profile_accept_rollback_us);", rollback_call);
         ok &= expect(rollback_call != std::string::npos &&
+                     rollback_guard != std::string::npos &&
                      rollback_sync != std::string::npos &&
                      next_accept_lap != std::string::npos &&
                      rollback_call < rollback_sync &&
+                     rollback_call < rollback_guard &&
+                     rollback_guard < rollback_sync &&
                      rollback_sync < next_accept_lap,
-            "DFlash recurrent multi-slot accept must synchronize flat rollback replay before the next slot mutates recurrent state");
+            "DFlash recurrent accept must defer single-slot flat rollback replay sync while still synchronizing multi-slot accept before the next slot mutates recurrent state");
+    }
+    {
+        const size_t draft_added = server_context.find("slot.n_draft_total += slot.spec_draft.size();");
+        const size_t draft_sync = server_context.find("llama_tape_replay_sync(ctx_tgt);", draft_added);
+        const size_t backup_call = server_context.find("dflash_backup_recurrent_state(slot.id, seq_backup);", draft_sync);
+        ok &= expect(draft_added != std::string::npos &&
+                     draft_sync != std::string::npos &&
+                     backup_call != std::string::npos &&
+                     draft_added < draft_sync &&
+                     draft_sync < backup_call,
+            "DFlash flat draft setup must synchronize any deferred rollback replay before recurrent backup");
     }
 
     // dflash_diagnostic_debug_enabled must gate per-ubatch route logs

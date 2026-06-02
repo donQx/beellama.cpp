@@ -6862,9 +6862,11 @@ private:
                         } else {
                             llama_clear_tree_parent_ids(ctx_tgt);
                             llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);
-                            // Multi-slot accept can immediately roll back another seq; make this
-                            // seq's async recurrent replay visible before the next mutation.
-                            llama_tape_replay_sync(ctx_tgt);
+                            if (n_slots_drafted > 1) {
+                                // Multi-slot accept can immediately roll back another seq; make this
+                                // seq's async recurrent replay visible before the next mutation.
+                                llama_tape_replay_sync(ctx_tgt);
+                            }
                         }
                     } else {
                         auto * mem = llama_get_memory(ctx_tgt);
