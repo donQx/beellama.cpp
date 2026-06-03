@@ -4310,7 +4310,6 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
         if (eos != LLAMA_TOKEN_NULL) { tmp[n_tmp++] = eos; }
         if (n_tmp == 0) { tmp[n_tmp++] = 0; }
 
-        llama_set_warmup(ctx_dft, true);
         int ret = llama_decode(ctx_dft, llama_batch_get_one(tmp, n_tmp));
         if (ret != 0) {
             LOG_WRN("%s: draft warmup decode failed: %d (non-fatal)\n", __func__, ret);
@@ -4322,7 +4321,6 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
         }
         llama_synchronize(ctx_dft);
         llama_perf_context_reset(ctx_dft);
-        llama_set_warmup(ctx_dft, false);
 
         LOG_INF("%s: draft model warmup complete\n", __func__);
     }
