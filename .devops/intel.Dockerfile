@@ -1,7 +1,6 @@
+# syntax=docker/dockerfile:1.7
+
 ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
-ARG BUILD_DATE=N/A
-ARG APP_VERSION=N/A
-ARG APP_REVISION=N/A
 
 ## Build Image
 
@@ -11,19 +10,24 @@ ARG GGML_SYCL_F16=OFF
 ARG SYCL_BUILD_TARGET=all
 ARG LEVEL_ZERO_VERSION=1.28.2
 ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
-RUN apt-get update && \
-    apt-get install -y git libssl-dev wget ca-certificates && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ccache git libssl-dev wget ca-certificates && \
     cd /tmp && \
     wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb && \
     wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb && \
     apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb && \
     rm -f /tmp/level-zero.deb /tmp/level-zero-devel.deb
 
+ENV CCACHE_SLOPPINESS=time_macros CCACHE_MAXSIZE=5G
+
 WORKDIR /app
 
 COPY . .
 
-RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
+RUN --mount=type=cache,target=/root/.ccache \
+    if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         echo "GGML_SYCL_F16 is set" \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
     fi && \
@@ -36,13 +40,16 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         -DCMAKE_CXX_COMPILER=icpx \
         -DGGML_BACKEND_DL=ON \
         -DGGML_CPU_ALL_VARIANTS=ON \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_BUILD_SERVER=ON \
         -DGGML_RPC=ON \
         ${OPT_SYCL_F16} && \
-    cmake --build build --config Release -j$(nproc) --target ${SYCL_BUILD_TARGET}
+    cmake --build build --config Release -j$(nproc) --target ${SYCL_BUILD_TARGET} && \
+    ccache --show-stats
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -57,19 +64,6 @@ RUN mkdir -p /app/full \
     && cp .devops/tools.sh /app/full/tools.sh
 
 FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS base
-
-ARG BUILD_DATE=N/A
-ARG APP_VERSION=N/A
-ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/Anbeeld/beellama.cpp
-ARG IMAGE_SOURCE=https://github.com/Anbeeld/beellama.cpp
-LABEL org.opencontainers.image.created=$BUILD_DATE \
-      org.opencontainers.image.version=$APP_VERSION \
-      org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.title="BeeLlama.cpp" \
-      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
-      org.opencontainers.image.url=$IMAGE_URL \
-      org.opencontainers.image.source=$IMAGE_SOURCE
 
 ARG IGC_VERSION=v2.20.5
 ARG IGC_VERSION_FULL=2_2.20.5+19972
@@ -88,13 +82,24 @@ RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
   && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
   && dpkg --install *.deb
 
-RUN apt-get update \
-    && apt-get install -y libgomp1 curl \
-    && apt autoremove -y \
-    && apt clean -y \
-    && rm -rf /tmp/* /var/tmp/* \
-    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
-    && find /var/cache -type f -delete
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 curl \
+    && rm -rf /tmp/* /var/tmp/*
+
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/Anbeeld/beellama.cpp
+ARG IMAGE_SOURCE=https://github.com/Anbeeld/beellama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="BeeLlama.cpp" \
+      org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
 
 ### Full
 FROM base AS full

@@ -8,10 +8,6 @@ ARG BASE_CUDA_DEV_CONTAINER=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VER
 
 ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
-ARG BUILD_DATE=N/A
-ARG APP_VERSION=N/A
-ARG APP_REVISION=N/A
-
 FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 
 # CUDA architecture to build for (defaults to all supported archs)
@@ -22,10 +18,9 @@ ARG CUDA_BUILD_TARGET=all
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && \
-    apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache python3 python3-pip git libssl-dev libgomp1 && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache python3 python3-pip git libssl-dev libgomp1
 
-ENV CC=gcc CXX=g++ CUDAHOSTCXX=g++ CCACHE_SLOPPINESS=time_macros CCACHE_MAXSIZE=2G
+ENV CC=gcc CXX=g++ CUDAHOSTCXX=g++ CCACHE_SLOPPINESS=time_macros CCACHE_MAXSIZE=5G
 
 WORKDIR /app
 
@@ -70,6 +65,14 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_CUDA_RUN_CONTAINER} AS base
 
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 curl \
+    && rm -rf /tmp/* /var/tmp/*
+
+COPY --from=build /app/lib/ /app
+
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
@@ -82,16 +85,6 @@ LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.description="BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
-
-RUN apt-get update \
-    && apt-get install -y libgomp1 curl \
-    && apt autoremove -y \
-    && apt clean -y \
-    && rm -rf /tmp/* /var/tmp/* \
-    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
-    && find /var/cache -type f -delete
-
-COPY --from=build /app/lib/ /app
 
 ### Full
 FROM base AS full

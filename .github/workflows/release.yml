@@ -616,6 +616,9 @@ jobs:
     name: Windows x64 CUDA ${{ matrix.cuda }}
     needs: release-meta
     runs-on: windows-2022
+    env:
+      CCACHE_MAXSIZE: 5G
+      CCACHE_SLOPPINESS: time_macros
     strategy:
       fail-fast: false
       matrix:
@@ -638,10 +641,38 @@ jobs:
           variant: ccache
           evict-old-files: 1d
 
+      - name: Cache CUDA Toolkit
+        id: cache-cuda
+        uses: actions/cache@v5
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda }}
+          key: cuda-windows-${{ matrix.cuda }}-${{ hashFiles('.github/actions/windows-setup-cuda/action.yml') }}
+
       - name: Install CUDA Toolkit
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: ${{ matrix.cuda }}
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda }}"
+          $nvcc = Join-Path $cudaPath "bin\nvcc.exe"
+          if (-not (Test-Path $nvcc)) {
+            throw "CUDA Toolkit not found at $cudaPath"
+          }
+
+          Join-Path $cudaPath "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $libNvvp = Join-Path $cudaPath "libnvvp"
+          if (Test-Path $libNvvp) {
+            $libNvvp | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $versionEnv = "CUDA_PATH_V${{ matrix.cuda }}".Replace(".", "_")
+          "$versionEnv=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -658,6 +689,7 @@ jobs:
             -DGGML_CUDA_FA=ON ^
             -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
             -DGGML_CUDA_CUB_3DOT2=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
@@ -872,6 +904,23 @@ jobs:
           release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
           changelog_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
           image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          repo_name="${repo_name,,}"
+          package_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container/${repo_name}"
+
+          docker_link() {
+            local tag="$1"
+            printf '[`%s:%s`](%s)' "${image_repo}" "${tag}" "${package_url}"
+          }
+
+          docker_server="$(docker_link "server-${TAG_NAME}")"
+          docker_cpu="$(docker_link "server-cpu-${TAG_NAME}")"
+          docker_cuda="$(docker_link "server-cuda-${TAG_NAME}")"
+          docker_cuda12="$(docker_link "server-cuda12-${TAG_NAME}")"
+          docker_cuda13="$(docker_link "server-cuda13-${TAG_NAME}")"
+          docker_rocm="$(docker_link "server-rocm-${TAG_NAME}")"
+          docker_vulkan="$(docker_link "server-vulkan-${TAG_NAME}")"
+          docker_sycl="$(docker_link "server-sycl-${TAG_NAME}")"
 
           cat > release-notes.md << EOF
           <details open>
@@ -898,12 +947,12 @@ jobs:
           - [Windows x64 (HIP)](${release_url}/beellama-${TAG_NAME}-bin-win-hip-radeon-x64.zip)
 
           **Docker:**
-          - \`${image_repo}:server-${TAG_NAME}\` / \`${image_repo}:server-cpu-${TAG_NAME}\` (CPU, linux/amd64 + linux/arm64; usable on Apple Silicon Docker Desktop without Metal acceleration)
-          - \`${image_repo}:server-cuda-${TAG_NAME}\` / \`${image_repo}:server-cuda12-${TAG_NAME}\`
-          - \`${image_repo}:server-cuda13-${TAG_NAME}\`
-          - \`${image_repo}:server-rocm-${TAG_NAME}\`
-          - \`${image_repo}:server-vulkan-${TAG_NAME}\`
-          - \`${image_repo}:server-sycl-${TAG_NAME}\`
+          - ${docker_server} / ${docker_cpu} (CPU, linux/amd64 + linux/arm64; usable on Apple Silicon Docker Desktop without Metal acceleration)
+          - ${docker_cuda} / ${docker_cuda12}
+          - ${docker_cuda13}
+          - ${docker_rocm}
+          - ${docker_vulkan}
+          - ${docker_sycl}
           EOF
 
       - name: Upload release assets
@@ -914,12 +963,68 @@ jobs:
             release/*
             release-notes.md
 
+  wait-docker:
+    name: Wait for Docker images
+    if: ${{ needs.release-meta.outputs.create_release == 'true' }}
+    needs:
+      - release-meta
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for Docker workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          deadline=$((SECONDS + 7200))
+          while (( SECONDS < deadline )); do
+            run_info="$(
+              gh run list \
+                --repo "${GITHUB_REPOSITORY}" \
+                --workflow docker.yml \
+                --commit "${HEAD_SHA}" \
+                --event push \
+                --json databaseId,status,conclusion,headBranch,url,createdAt \
+                --limit 20 \
+                --jq "map(select(.headBranch == \"${TAG_NAME}\" or .headBranch == \"${REF_NAME}\" or .headBranch == \"\" or .headBranch == null)) | sort_by(.createdAt) | reverse | .[0] | select(. != null) | [.databaseId, .status, (.conclusion // \"\"), .url] | @tsv"
+            )"
+
+            if [[ -z "${run_info}" ]]; then
+              echo "Waiting for Docker workflow run for ${TAG_NAME} (${HEAD_SHA})..."
+              sleep 30
+              continue
+            fi
+
+            IFS=$'\t' read -r run_id status conclusion url <<< "${run_info}"
+            echo "Docker workflow run ${run_id}: status=${status} conclusion=${conclusion:-pending} ${url}"
+
+            if [[ "${status}" == "completed" ]]; then
+              if [[ "${conclusion}" == "success" ]]; then
+                exit 0
+              fi
+              echo "Docker workflow did not succeed: ${conclusion}" >&2
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "Timed out waiting for Docker workflow for ${TAG_NAME} (${HEAD_SHA})." >&2
+          exit 1
+
   release:
     name: Publish GitHub release
     if: ${{ needs.release-meta.outputs.create_release == 'true' }}
     needs:
       - release-meta
       - package-assets
+      - wait-docker
     runs-on: ubuntu-24.04
     permissions:
       contents: write
