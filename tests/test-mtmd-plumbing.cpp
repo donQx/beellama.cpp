@@ -87,6 +87,10 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("params_base.n_batch = std::max(params_base.n_batch, mmproj_decode_req.min_decoder_batch_tokens)") != std::string::npos &&
                  server_context.find("params_base.n_ubatch = std::max(params_base.n_ubatch, mmproj_decode_req.min_decoder_batch_tokens)") != std::string::npos,
         "server must raise batch and ubatch before context creation for full non-causal image chunks");
+    ok &= expect(server_context.find("if (mctx && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {\n                    GGML_ABORT(\"not supported by multimodal\");") == std::string::npos,
+        "server must not abort non-DFlash speculative text requests just because mmproj is loaded");
+    ok &= expect(server_context.find("slot.prompt.tokens.has_media()") != std::string::npos,
+        "server must gate non-DFlash speculative multimodal fallback on actual media in the active prompt");
 
     ok &= expect(mtmd_helper.find("const int32_t n_ubatch = llama_n_ubatch(lctx)") != std::string::npos,
         "mtmd image decode must inspect the decoder physical ubatch");

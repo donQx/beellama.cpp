@@ -4638,13 +4638,17 @@ private:
             const bool dflash_sampler_blocks_speculative =
                 params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                 slot.smpl && common_sampler_reasoning_is_forcing(slot.smpl.get());
+            const bool non_dflash_media_prompt =
+                mctx &&
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                slot.prompt.tokens.has_media();
+            if (non_dflash_media_prompt) {
+                SLT_DBG(slot, "%s", "non-DFlash speculative decoding does not support media inputs; using regular decode\n");
+                n_draft_max = 0;
+            }
 
             if (n_draft_max > 0 && !dflash_sampler_blocks_speculative) {
                 const int64_t t_draft_slot_start = ggml_time_us();
-
-                if (mctx && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                    GGML_ABORT("not supported by multimodal");
-                }
 
                 auto params_spec = slot.task->params.speculative;
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
