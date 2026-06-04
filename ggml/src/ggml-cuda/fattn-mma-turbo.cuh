@@ -86,18 +86,23 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     template void ggml_cuda_flash_attn_ext_mma_turbo_case                                            \
     <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)            \
 
-// turbo4_0 matched K/V at D=128 and D=256. ncols2 ≤ 8.
-#define DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(DKQ, DV, ncols)                                                 \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
+// Straight TurboQuant matched K/V at D=128 and D=256. ncols2 <= 8.
+#define DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_NCOLS2(DKQ, DV, ncols, tK)                         \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, tK, tK);                               \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, tK, tK);                               \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, tK, tK);                               \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, tK, tK);                               \
 
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128,  8)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 16)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 32)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 64)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256,  8)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 16)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 32)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 64)
+#define DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(DKQ, DV, ncols)                               \
+    DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_NCOLS2(DKQ, DV, ncols, GGML_TYPE_TURBO4_0)              \
+    DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_NCOLS2(DKQ, DV, ncols, GGML_TYPE_TURBO3_0)              \
+    DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_NCOLS2(DKQ, DV, ncols, GGML_TYPE_TURBO2_0)              \
+
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(128, 128,  8)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(128, 128, 16)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(128, 128, 32)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(128, 128, 64)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(256, 256,  8)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(256, 256, 16)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(256, 256, 32)
+DECL_FATTN_MMA_TURBO_STRAIGHT_CASE_ALL_TYPES(256, 256, 64)
