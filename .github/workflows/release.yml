@@ -1170,7 +1170,11 @@ jobs:
     if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
     needs:
       - release-meta
-      - package-assets
+      - ubuntu-cpu
+      - ubuntu-vulkan
+      - ubuntu-rocm
+      - ubuntu-sycl
+      - ubuntu-cuda
     runs-on: ${{ matrix.config.runs_on }}
     strategy:
       fail-fast: false
