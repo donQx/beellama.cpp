@@ -1243,12 +1243,15 @@ int main(int argc, char ** argv) {
         "single-slot speculative accept must propagate accept(0), which MTP uses to advance pending target hidden state after rejection");
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
-    ok &= expect(server_context.find("bool speculative_needs_recurrent_backup_sequences() const") != std::string::npos &&
+    ok &= expect(server_context.find("server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const") != std::string::npos &&
                  server_context.find("params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
+                 server_context.find("flat DFlash target architecture %s will use %u recurrent snapshots per visible slot") != std::string::npos &&
                  server_context.find("ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos,
-        "server must use Bee backup rollback only for DFlash on non-RS contexts; MTP uses checkpoint-based accept path");
-    ok &= expect(common_h.find("return needs_rs_seq ? draft.n_max : 0u;") != std::string::npos,
-        "MTP target context must enable bounded recurrent snapshots for upstream rollback");
+        "server must use RS snapshots for flat DFlash when available and backup rollback only on non-RS DFlash contexts");
+    ok &= expect(common_h.find("t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||") != std::string::npos &&
+                 common_h.find("t == COMMON_SPECULATIVE_TYPE_DFLASH && branch_budget == 0") != std::string::npos &&
+                 common_cpp.find("const uint32_t n_rs_batch = cparams.n_rs_seq + 1") != std::string::npos,
+        "MTP and flat DFlash target contexts must enable bounded recurrent snapshots and reserve verifier batch width");
     ok &= expect(server_context.find("cparams.n_rs_seq = 0") != std::string::npos,
         "MTP draft context creation must force n_rs_seq = 0 (upstream invariant: MTP heads have no delta-net layers)");
     ok &= expect(server_context.find("const bool slot_uses_fork_spec") != std::string::npos &&
@@ -2180,19 +2183,21 @@ int main(int argc, char ** argv) {
                  server_context.find("server_arch_name_is_recurrent_or_hybrid") != std::string::npos &&
                  server_context.find("\"qwen35\"") != std::string::npos &&
                  server_context.find("\"gemma4\"") == std::string::npos &&
-                 server_context.find("does not need recurrent backup streams") != std::string::npos,
-        "DFlash recurrent backup stream allocation must be gated by probed recurrent/hybrid target architecture");
-    ok &= expect(server_context.find("DFlash target requires recurrent rollback, but recurrent backup streams were not reserved") != std::string::npos,
-        "DFlash startup must fail closed if a recurrent/hybrid target was loaded without backup stream reservation");
+                 server_context.find("does not need recurrent rollback") != std::string::npos &&
+                 server_context.find("server_arch_name_supports_rs_rollback") != std::string::npos,
+        "DFlash recurrent rollback allocation must be gated by probed recurrent/hybrid and RS-capable target architecture");
+    ok &= expect(server_context.find("DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available") != std::string::npos,
+        "DFlash startup must fail closed if a recurrent/hybrid target has no rollback mechanism");
     ok &= expect(server_context.find("params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&
-                 server_context.find("KVarN requires non-unified KV; keeping separate KV streams for speculative backup") != std::string::npos,
-        "DFlash recurrent backup auto-unification must not override KVarN non-unified streams");
-    ok &= expect(server_context.find("server_context_n_ctx_for_internal_seqs(") != std::string::npos &&
-                 server_context.find("kv_unified_effective") != std::string::npos &&
-                 server_context.find("expanded target n_ctx from %d to %d") != std::string::npos &&
-                 server_context.find("llama_init = common_init_from_params(params_base);") != std::string::npos &&
-                 server_context.find("expanded target n_ctx from %d to %d") < server_context.find("llama_init = common_init_from_params(params_base);"),
-        "DFlash recurrent backup internal sequences must not halve KVarN/non-unified visible slot context");
+                 server_context.find("KVarN requires non-unified KV; DDTree backup streams will share the configured total KV context") != std::string::npos,
+        "DFlash DDTree backup auto-unification must not override KVarN non-unified streams");
+    ok &= expect(server_context.find("server_context_n_ctx_for_internal_seqs(") == std::string::npos &&
+                 server_context.find("expanded target n_ctx from %d to %d") == std::string::npos &&
+                 server_context.find("recurrent_backup_attention_streams") != std::string::npos &&
+                 llama_h.find("llama_memory_seq_rm_recurrent") != std::string::npos &&
+                 memory_h.find("virtual bool seq_rm_recurrent") != std::string::npos &&
+                 context_cpp.find("Flat mode: no duplicate entries at same position, safe to keep accepted KV\n        int kv_keep_pos = n_past_before + n_accepted;\n        mem_attn->seq_rm(seq_id, kv_keep_pos, -1);") != std::string::npos,
+        "DFlash flat recurrent rollback must not preserve visible context by allocating dead backup KV streams");
     ok &= expect(context_cpp.find("llama_memory_seq_add") != std::string::npos &&
                  context_cpp.find("llama_memory_can_shift(mem)") != std::string::npos &&
                  context_cpp.find("cannot add/divide sequence positions because the memory implementation does not support shifting") != std::string::npos,

@@ -4017,7 +4017,6 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
         // Flat mode: no duplicate entries at same position, safe to keep accepted KV
         int kv_keep_pos = n_past_before + n_accepted;
         mem_attn->seq_rm(seq_id, kv_keep_pos, -1);
-        mem_attn->seq_rm(seq_backup, -1, -1);
     }
     profile_lap(attn_us);
 
@@ -9342,6 +9341,18 @@ void llama_memory_seq_cp_recurrent(
     }
 
     mem->seq_cp_recurrent(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_seq_rm_recurrent(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_recurrent(seq_id, p0, p1);
 }
 
 void llama_memory_seq_keep(

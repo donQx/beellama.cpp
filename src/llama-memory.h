@@ -143,6 +143,12 @@ struct llama_memory_i {
     // where KV backup is unnecessary — flat mode rollback trims rejected positions
     // without needing a full KV restore.
     virtual void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    virtual bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(p0);
+        GGML_UNUSED(p1);
+        return true;
+    }
     virtual void recurrent_copy_profile_reset() {}
     virtual llama_memory_recurrent_copy_profile recurrent_copy_profile() const { return {}; }
     virtual void seq_keep(llama_seq_id seq_id) = 0;

@@ -857,6 +857,13 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Remove only recurrent state (skip KV/attention) for a sequence.
+    LLAMA_API bool llama_memory_seq_rm_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

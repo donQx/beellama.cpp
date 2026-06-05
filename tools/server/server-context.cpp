@@ -33,11 +33,9 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
-#include <limits>
 #include <random>
 #include <cmath>
 #include <set>
-#include <stdexcept>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -51,23 +49,24 @@
 
 using json = nlohmann::ordered_json;
 
-int32_t server_context_n_ctx_for_internal_seqs(
-        int32_t n_ctx,
-        int32_t n_parallel_user,
-        int32_t n_seq_max_full,
-        bool    kv_unified_effective) {
-    if (n_ctx <= 0 || kv_unified_effective || n_parallel_user <= 0 || n_seq_max_full <= n_parallel_user) {
-        return n_ctx;
+server_dflash_recurrent_rollback_plan server_context_dflash_recurrent_rollback_plan(
+        const common_params_speculative & speculative,
+        bool target_recurrent_or_hybrid,
+        bool target_supports_rs_rollback) {
+    server_dflash_recurrent_rollback_plan plan;
+
+    if (speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || !target_recurrent_or_hybrid) {
+        return plan;
     }
 
-    const int64_t numerator = (int64_t) n_ctx * (int64_t) n_seq_max_full;
-    const int64_t adjusted  = (numerator + n_parallel_user - 1) / n_parallel_user;
-
-    if (adjusted > std::numeric_limits<int32_t>::max()) {
-        throw std::overflow_error("expanded context size for internal server sequences overflows int32");
+    if (speculative.branch_budget == 0 && target_supports_rs_rollback) {
+        plan.uses_rs_snapshots = true;
+        return plan;
     }
 
-    return (int32_t) adjusted;
+    plan.needs_backup_sequences = true;
+    plan.needs_attention_backup_streams = speculative.branch_budget > 0;
+    return plan;
 }
 
 static bool dflash_server_profile_enabled(uint32_t flags) {
@@ -101,6 +100,7 @@ static bool dflash_shared_drafter_batch_disabled() {
 struct server_model_arch_probe {
     bool known = false;
     bool recurrent_or_hybrid = false;
+    bool supports_rs_rollback = false;
     std::string name;
 };
 
@@ -127,6 +127,15 @@ static bool server_arch_name_is_recurrent_or_hybrid(const std::string & name) {
     };
 
     return recurrent_or_hybrid.find(name) != recurrent_or_hybrid.end();
+}
+
+static bool server_arch_name_supports_rs_rollback(const std::string & name) {
+    static const std::set<std::string> rs_rollback = {
+        "qwen35",
+        "qwen35moe",
+    };
+
+    return rs_rollback.find(name) != rs_rollback.end();
 }
 
 static server_model_arch_probe server_probe_model_arch(const std::string & path_model) {
@@ -157,6 +166,7 @@ static server_model_arch_probe server_probe_model_arch(const std::string & path_
             result.known = true;
             result.name = arch_name;
             result.recurrent_or_hybrid = server_arch_name_is_recurrent_or_hybrid(result.name);
+            result.supports_rs_rollback = server_arch_name_supports_rs_rollback(result.name);
         }
     }
 
@@ -1348,7 +1358,12 @@ struct server_slot : server_adaptive_dm_state {
 
             // clean up speculative backup sequence to avoid orphaned KV cells
             if (has_draft_backup && seq_id_backup >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
+                llama_memory_t mem = llama_get_memory(ctx_tgt);
+                if (has_recurrent_only_backup) {
+                    llama_memory_seq_rm_recurrent(mem, seq_id_backup, -1, -1);
+                } else {
+                    llama_memory_seq_rm(mem, seq_id_backup, -1, -1);
+                }
             }
 
             // do not keep context of the child slots - the parent's context is enough
@@ -1992,9 +2007,10 @@ private:
     // rejecting draft tokens, because the recurrent state cannot be rolled back
     bool needs_reeval = false;
     int  n_parallel_user = 0;
-    int  n_seq_max_full = 0;      // target n_seq_max after optional backup-sequence expansion
+    int  n_seq_max_full = 0;      // visible slots plus optional recurrent backup cells
     bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
     bool recurrent_backup_sequences = false; // explicit backup seqs for speculative recurrent rollback
+    bool recurrent_backup_attention_streams = false; // backup seqs also have attention KV streams
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -2106,24 +2122,40 @@ private:
         return llama_init_from_model(model_tgt, cparams);
     }
 
-    bool speculative_needs_recurrent_backup_sequences() const {
+    server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const {
+        server_dflash_recurrent_rollback_plan plan;
+
         if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-            return false;
+            return plan;
         }
 
         const server_model_arch_probe arch = server_probe_model_arch(params_base.model.path);
         if (!arch.known) {
-            SRV_WRN("%s", "could not determine target architecture before DFlash context allocation; reserving recurrent backup streams conservatively\n");
-            return true;
+            SRV_WRN("%s", "could not determine target architecture before DFlash context allocation; reserving recurrent-only backup cells conservatively\n");
+            plan.needs_backup_sequences = true;
+            return plan;
         }
 
-        const bool needs_backup = arch.recurrent_or_hybrid;
-        if (!needs_backup) {
-            SRV_INF("DFlash target architecture %s does not need recurrent backup streams; keeping n_parallel=%d\n",
+        plan = server_context_dflash_recurrent_rollback_plan(
+                params_base.speculative,
+                arch.recurrent_or_hybrid,
+                arch.supports_rs_rollback);
+
+        if (!arch.recurrent_or_hybrid) {
+            SRV_INF("DFlash target architecture %s does not need recurrent rollback; keeping n_parallel=%d\n",
                     arch.name.c_str(), params_base.n_parallel);
+        } else if (plan.uses_rs_snapshots) {
+            SRV_INF("flat DFlash target architecture %s will use %u recurrent snapshots per visible slot; keeping n_parallel=%d\n",
+                    arch.name.c_str(), params_base.speculative.need_n_rs_seq(), params_base.n_parallel);
+        } else if (plan.needs_attention_backup_streams) {
+            SRV_WRN("DFlash DDTree target architecture %s needs attention backup streams for branch rollback\n",
+                    arch.name.c_str());
+        } else if (plan.needs_backup_sequences) {
+            SRV_WRN("DFlash target architecture %s lacks bounded recurrent snapshots; reserving recurrent-only backup cells\n",
+                    arch.name.c_str());
         }
 
-        return needs_backup;
+        return plan;
     }
 
     void swap_mtp_to_mmproj_gpu() {
@@ -2215,7 +2247,11 @@ private:
         auto * mem = llama_get_memory(ctx_tgt);
         for (const server_slot & slot : slots) {
             const llama_seq_id seq_backup = slot.id + n_parallel_user;
-            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+            if (recurrent_backup_attention_streams) {
+                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+            } else {
+                llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1);
+            }
         }
 
         if (llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)) {
@@ -2372,6 +2408,7 @@ private:
         n_seq_max_full = n_parallel_user;
         recurrent_expanded = true;
         recurrent_backup_sequences = false;
+        recurrent_backup_attention_streams = false;
 
         const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
@@ -2451,9 +2488,10 @@ private:
             }
         }
 
-        // When mmproj GPU swap is active, run fitter before n_parallel doubling.
-        // The doubled n_parallel inflates recurrent state estimates, causing the
-        // fitter to think even minimum context doesn't fit.
+        // When mmproj GPU swap is active, run fitter before adding any DDTree
+        // attention-backup streams. Those internal streams inflate recurrent
+        // state estimates, causing the fitter to think even minimum context
+        // doesn't fit.
         if (params_base.mmproj_gpu_swap && has_mtp && has_mmproj
                 && params_base.fit_params && params_base.n_ctx == 0) {
             auto mparams_gpu = make_mmproj_params(true);
@@ -2495,31 +2533,23 @@ private:
             params_base.fit_params = false;
         }
 
-        if (speculative_needs_recurrent_backup_sequences()) {
-            params_base.n_parallel = n_parallel_user * 2;
-            n_seq_max_full = params_base.n_parallel;
+        const server_dflash_recurrent_rollback_plan recurrent_plan = speculative_recurrent_rollback_plan();
+        if (recurrent_plan.needs_backup_sequences) {
+            n_seq_max_full = n_parallel_user * 2;
             recurrent_expanded = false;
             recurrent_backup_sequences = true;
+            recurrent_backup_attention_streams = recurrent_plan.needs_attention_backup_streams;
 
-            if (!params_base.kv_unified && n_parallel_user == 1 &&
-                    params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
-                params_base.kv_unified = true;
-                SRV_INF("%s", "auto-enabled kv-unified: spec decode backup doesn't need separate KV stream\n");
-            } else if (!params_base.kv_unified && n_parallel_user == 1) {
-                SRV_WRN("%s", "KVarN requires non-unified KV; keeping separate KV streams for speculative backup\n");
-            }
+            if (recurrent_backup_attention_streams) {
+                params_base.n_parallel = n_seq_max_full;
 
-            const bool kv_unified_effective =
-                params_base.kv_unified && params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED;
-            const int32_t n_ctx_before_internal_seqs = params_base.n_ctx;
-            params_base.n_ctx = server_context_n_ctx_for_internal_seqs(
-                    params_base.n_ctx,
-                    n_parallel_user,
-                    n_seq_max_full,
-                    kv_unified_effective);
-            if (params_base.n_ctx != n_ctx_before_internal_seqs) {
-                SRV_INF("expanded target n_ctx from %d to %d so %d visible slot(s) keep their configured context with %d internal sequences and non-unified KV\n",
-                        n_ctx_before_internal_seqs, params_base.n_ctx, n_parallel_user, n_seq_max_full);
+                if (!params_base.kv_unified && n_parallel_user == 1 &&
+                        params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+                    params_base.kv_unified = true;
+                    SRV_INF("%s", "auto-enabled kv-unified: DDTree backup uses internal attention streams\n");
+                } else if (!params_base.kv_unified && n_parallel_user == 1) {
+                    SRV_WRN("%s", "KVarN requires non-unified KV; DDTree backup streams will share the configured total KV context\n");
+                }
             }
         }
 
@@ -2537,16 +2567,28 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
-        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && needs_reeval && !recurrent_backup_sequences) {
-            SRV_ERR("%s", "DFlash target requires recurrent rollback, but recurrent backup streams were not reserved before context allocation\n");
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                needs_reeval &&
+                !recurrent_backup_sequences &&
+                llama_n_rs_seq(ctx_tgt) == 0) {
+            SRV_ERR("%s", "DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available\n");
             return false;
+        }
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                recurrent_backup_sequences &&
+                !recurrent_backup_attention_streams &&
+                llama_n_rs_seq(ctx_tgt) > 0) {
+            SRV_INF("%s", "loaded DFlash target exposes recurrent snapshots; dropping conservative backup cells\n");
+            recurrent_backup_sequences = false;
+            recurrent_expanded = true;
+            n_seq_max_full = n_parallel_user;
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (recurrent_backup_sequences && !recurrent_expanded && needs_reeval) {
+        if (recurrent_backup_sequences && recurrent_backup_attention_streams && !recurrent_expanded && needs_reeval) {
             if (llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)) {
                 SRV_INF("shrunk recurrent state to %d cells before draft load (deferred %d backup cells)\n",
                         n_parallel_user, n_seq_max_full - n_parallel_user);
@@ -5147,7 +5189,11 @@ private:
                                 }
                                 const llama_seq_id seq_backup = slot.id + n_parallel_user;
                                 auto * mem = llama_get_memory(ctx_tgt);
-                                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                                if (recurrent_backup_attention_streams) {
+                                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                                } else {
+                                    llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1);
+                                }
                                 if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                                     dflash_backup_recurrent_state(slot.id, seq_backup);
                                     slot.has_recurrent_only_backup = true;
@@ -7355,7 +7401,11 @@ private:
                         if (all_accepted_flat) {
                             llama_clear_tree_parent_ids(ctx_tgt);
                             auto * mem = llama_get_memory(ctx_tgt);
-                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            if (slot.has_recurrent_only_backup) {
+                                llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1);
+                            } else {
+                                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            }
                             llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
                             llama_clear_tree_parent_ids(ctx_tgt);

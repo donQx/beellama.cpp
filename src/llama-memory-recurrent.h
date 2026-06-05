@@ -54,6 +54,9 @@ public:
     void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override {
         seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
+    bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
+        return seq_rm(seq_id, p0, p1);
+    }
     void seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
     void recurrent_copy_profile_reset() override;
     llama_memory_recurrent_copy_profile recurrent_copy_profile() const override;
