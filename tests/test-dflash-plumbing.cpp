@@ -2234,6 +2234,9 @@ int main(int argc, char ** argv) {
                  server_context.find("draft memory cannot trim from") == std::string::npos &&
                  server_context.find("server_prompt_checkpoint_matches_restore_window") != std::string::npos,
         "server prompt-cache restore must not preflight checkpoints against the live memory state");
+    ok &= expect(server_context.find("const bool has_new_tokens = n_past < slot.task->n_tokens();") != std::string::npos &&
+                 server_context.find("pos_next - n_swa - (has_new_tokens ? 0 : 1)") != std::string::npos,
+        "server prompt-cache checkpoint threshold must account for newly appended suffix tokens");
     ok &= expect(server_context.find("const llama_pos prompt_trim_p0 = slot.prompt.tokens.pos_next(n_past);") != std::string::npos &&
                  server_context.find("memory cannot trim cached suffix") != std::string::npos &&
                  server_context.find("slot.prompt.checkpoints.clear();") != std::string::npos,

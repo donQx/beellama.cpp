@@ -80,6 +80,18 @@ int main() {
                 /*pos_min_thold =*/ 0,
                 /*pos_next =*/ 17849,
                 /*is_recurrent_or_hybrid =*/ true));
+
+        ckpt.update_pos(4123, 127, 127);
+        assert(server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 0,
+                /*pos_next =*/ 127,
+                /*is_recurrent_or_hybrid =*/ true));
+        assert(!server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 0,
+                /*pos_next =*/ 39,
+                /*is_recurrent_or_hybrid =*/ true));
     }
 
     {
