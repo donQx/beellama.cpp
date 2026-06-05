@@ -33,9 +33,11 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <limits>
 #include <random>
 #include <cmath>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -48,6 +50,25 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+int32_t server_context_n_ctx_for_internal_seqs(
+        int32_t n_ctx,
+        int32_t n_parallel_user,
+        int32_t n_seq_max_full,
+        bool    kv_unified_effective) {
+    if (n_ctx <= 0 || kv_unified_effective || n_parallel_user <= 0 || n_seq_max_full <= n_parallel_user) {
+        return n_ctx;
+    }
+
+    const int64_t numerator = (int64_t) n_ctx * (int64_t) n_seq_max_full;
+    const int64_t adjusted  = (numerator + n_parallel_user - 1) / n_parallel_user;
+
+    if (adjusted > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("expanded context size for internal server sequences overflows int32");
+    }
+
+    return (int32_t) adjusted;
+}
 
 static bool dflash_server_profile_enabled(uint32_t flags) {
     return dflash_profile_enabled(flags);
@@ -2486,6 +2507,19 @@ private:
                 SRV_INF("%s", "auto-enabled kv-unified: spec decode backup doesn't need separate KV stream\n");
             } else if (!params_base.kv_unified && n_parallel_user == 1) {
                 SRV_WRN("%s", "KVarN requires non-unified KV; keeping separate KV streams for speculative backup\n");
+            }
+
+            const bool kv_unified_effective =
+                params_base.kv_unified && params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED;
+            const int32_t n_ctx_before_internal_seqs = params_base.n_ctx;
+            params_base.n_ctx = server_context_n_ctx_for_internal_seqs(
+                    params_base.n_ctx,
+                    n_parallel_user,
+                    n_seq_max_full,
+                    kv_unified_effective);
+            if (params_base.n_ctx != n_ctx_before_internal_seqs) {
+                SRV_INF("expanded target n_ctx from %d to %d so %d visible slot(s) keep their configured context with %d internal sequences and non-unified KV\n",
+                        n_ctx_before_internal_seqs, params_base.n_ctx, n_parallel_user, n_seq_max_full);
             }
         }
 

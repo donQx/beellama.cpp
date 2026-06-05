@@ -2187,6 +2187,12 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&
                  server_context.find("KVarN requires non-unified KV; keeping separate KV streams for speculative backup") != std::string::npos,
         "DFlash recurrent backup auto-unification must not override KVarN non-unified streams");
+    ok &= expect(server_context.find("server_context_n_ctx_for_internal_seqs(") != std::string::npos &&
+                 server_context.find("kv_unified_effective") != std::string::npos &&
+                 server_context.find("expanded target n_ctx from %d to %d") != std::string::npos &&
+                 server_context.find("llama_init = common_init_from_params(params_base);") != std::string::npos &&
+                 server_context.find("expanded target n_ctx from %d to %d") < server_context.find("llama_init = common_init_from_params(params_base);"),
+        "DFlash recurrent backup internal sequences must not halve KVarN/non-unified visible slot context");
     ok &= expect(context_cpp.find("llama_memory_seq_add") != std::string::npos &&
                  context_cpp.find("llama_memory_can_shift(mem)") != std::string::npos &&
                  context_cpp.find("cannot add/divide sequence positions because the memory implementation does not support shifting") != std::string::npos,

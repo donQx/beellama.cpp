@@ -7,10 +7,20 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <set>
 
 struct server_context_impl; // private implementation
+
+// The public server -c/--ctx-size value describes user-visible slot capacity.
+// Bee may allocate extra internal sequence ids for recurrent rollback; these
+// must not shrink slot capacity when KV streams are non-unified.
+int32_t server_context_n_ctx_for_internal_seqs(
+        int32_t n_ctx,
+        int32_t n_parallel_user,
+        int32_t n_seq_max_full,
+        bool    kv_unified_effective);
 
 struct server_context_meta {
     std::string build_info;
