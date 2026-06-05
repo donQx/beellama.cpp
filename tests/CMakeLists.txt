@@ -123,6 +123,11 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-turbo-mma-fused-static.py)
     set_property(TEST test-turbo-mma-fused-static PROPERTY LABELS cuda)
+    add_test(
+        NAME test-hip-shuffle-compat-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-hip-shuffle-compat-static.py)
+    set_property(TEST test-hip-shuffle-compat-static PROPERTY LABELS hip)
 endif()
 
 # build test-tokenizer-0 target once and add many tests
