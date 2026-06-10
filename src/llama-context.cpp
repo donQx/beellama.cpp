@@ -8414,9 +8414,8 @@ llama_context * llama_init_from_model(
                     LLAMA_LOG_WARN("%s: KVarN requires Flash Attention; enabling it\n", __func__);
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 }
-                if (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16) {
-                    LLAMA_LOG_WARN("%s: --cache-type-k/v are ignored while KVarN is enabled\n", __func__);
-                }
+                LLAMA_LOG_INFO("%s: KVarN layers use structured records; non-KVarN layers (e.g. SWA) use type_k = %s, type_v = %s\n",
+                        __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
                 if (params.kvarn.type != LLAMA_KVARN_K4V2_G128) {
                     LLAMA_LOG_WARN("%s: KVarN preset %s is experimental; only kvarn_k4v2_g128 is reference-aligned\n",
                             __func__, llama_kvarn_type_name(params.kvarn.type));

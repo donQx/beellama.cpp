@@ -461,15 +461,30 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
     return llama_kvarn_type_from_name(string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
+// layers that cannot use structured KVarN records (e.g. iSWA SWA layers) fall back to a
+// normal KV cache with cache_type_k/v; match the requested KVarN bit width instead of
+// f16 so the fallback layers do not dominate memory use
+static ggml_type kvarn_fallback_cache_type(int32_t bits) {
+    switch (bits) {
+        case 2:  return GGML_TYPE_TURBO2_0;
+        case 3:  return GGML_TYPE_TURBO3_0;
+        case 4:  return GGML_TYPE_Q4_0;
+        case 5:  return GGML_TYPE_Q5_0;
+        case 6:  return GGML_TYPE_Q6_0;
+        case 8:  return GGML_TYPE_Q8_0;
+        default: return GGML_TYPE_F16;
+    }
+}
+
 static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
     const int32_t kvarn_bits = kvarn_bits_from_cache_type(value);
     if (kvarn_bits != 0) {
         if (key) {
             params.cache_kvarn_bits_k = kvarn_bits;
-            params.cache_type_k       = GGML_TYPE_F16;
+            params.cache_type_k       = kvarn_fallback_cache_type(kvarn_bits);
         } else {
             params.cache_kvarn_bits_v = kvarn_bits;
-            params.cache_type_v       = GGML_TYPE_F16;
+            params.cache_type_v       = kvarn_fallback_cache_type(kvarn_bits);
         }
         return;
     }
@@ -1045,8 +1060,8 @@ static void common_params_kvarn_normalize(common_params & params) {
 
     params.cache_kvarn_bits_k = key_bits;
     params.cache_kvarn_bits_v = value_bits;
-    params.cache_type_k       = GGML_TYPE_F16;
-    params.cache_type_v       = GGML_TYPE_F16;
+    params.cache_type_k       = kvarn_fallback_cache_type(key_bits);
+    params.cache_type_v       = kvarn_fallback_cache_type(value_bits);
 
     if (params.grp_attn_n != 1) {
         throw std::invalid_argument("KVarN does not support Self-Extend/group attention; use --grp-attn-n 1");

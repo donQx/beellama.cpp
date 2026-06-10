@@ -575,9 +575,24 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
     return llama_kvarn_type_from_name(string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
+// layers that cannot use structured KVarN records (e.g. iSWA SWA layers) fall back to a
+// normal KV cache with this type; match the requested KVarN bit width instead of f16 so
+// the fallback layers do not dominate memory use (same mapping as common/arg.cpp)
+static ggml_type kvarn_fallback_cache_type(int32_t bits) {
+    switch (bits) {
+        case 2:  return GGML_TYPE_TURBO2_0;
+        case 3:  return GGML_TYPE_TURBO3_0;
+        case 4:  return GGML_TYPE_Q4_0;
+        case 5:  return GGML_TYPE_Q5_0;
+        case 6:  return GGML_TYPE_Q6_0;
+        case 8:  return GGML_TYPE_Q8_0;
+        default: return GGML_TYPE_F16;
+    }
+}
+
 static bench_cache_type bench_cache_type_from_name(const std::string & name) {
     if (const int32_t kvarn_bits = kvarn_bits_from_cache_type(name)) {
-        return { GGML_TYPE_F16, kvarn_bits };
+        return { kvarn_fallback_cache_type(kvarn_bits), kvarn_bits };
     }
 
     return { ggml_type_from_name(name), 0 };
