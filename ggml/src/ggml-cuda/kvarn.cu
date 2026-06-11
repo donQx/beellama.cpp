@@ -1,6 +1,12 @@
 #include "kvarn.cuh"
 
+#include <algorithm>
+#include <array>
+#include <climits>
 #include <cstdlib>
+#include <cstdio>
+#include <mutex>
+#include <vector>
 
 static constexpr int KVAR_N_DIM = 128;
 static constexpr int KVAR_N_STAGE_GROUPS = 3;
@@ -9,6 +15,350 @@ static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 6 * KVAR_N_DIM 
 static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
 static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2;
 static constexpr int KVAR_N_LOWSHMEM_BYTES = KVAR_N_LOWSHMEM_FLOATS * sizeof(float);
+
+enum class kvarn_prof_kind : uint8_t {
+    STORE_HI = 0,
+    STORE_LOW,
+    LIVE_GROUPS,
+    MATERIALIZE,
+    COUNT,
+};
+
+static bool kvarn_profile_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("GGML_KVARN_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+static int kvarn_profile_dump_every() {
+    static const int dump_every = []() {
+        const char * v = std::getenv("GGML_KVARN_PROFILE");
+        if (v == nullptr) {
+            return 0;
+        }
+
+        const int parsed = std::atoi(v);
+        return parsed > 1 ? parsed : 0;
+    }();
+    return dump_every;
+}
+
+static bool kvarn_profile_cuda_graphs_disabled() {
+    static const bool disabled = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+    return disabled;
+}
+
+struct kvarn_prof_event_pair {
+    cudaEvent_t ev0 = nullptr;
+    cudaEvent_t ev1 = nullptr;
+    int device = -1;
+};
+
+struct kvarn_prof_sample {
+    kvarn_prof_kind kind = kvarn_prof_kind::STORE_HI;
+    uint8_t side = 0;
+    uint8_t bits = 0;
+    int n_kv = 0;
+    size_t bytes_out = 0;
+    kvarn_prof_event_pair events;
+};
+
+struct kvarn_prof_bucket {
+    uint64_t count = 0;
+    double total_ms = 0.0;
+    double max_ms = 0.0;
+    size_t total_bytes = 0;
+    int n_kv_min = INT_MAX;
+    int n_kv_max = 0;
+    std::array<uint64_t, 5> n_kv_buckets = {};
+};
+
+struct kvarn_prof_state {
+    static constexpr int max_events_per_device = 8192;
+    static constexpr int event_batch = 256;
+    static constexpr size_t flush_threshold = 4096;
+
+    std::mutex mutex;
+    std::array<std::vector<kvarn_prof_event_pair>, GGML_CUDA_MAX_DEVICES> free_events;
+    std::array<int, GGML_CUDA_MAX_DEVICES> created_events = {};
+    std::vector<kvarn_prof_sample> pending;
+    kvarn_prof_bucket aggregates[(int) kvarn_prof_kind::COUNT][2];
+    uint64_t flush_count = 0;
+    bool final_dump_done = false;
+
+    bool make_event_pair_locked(int device, kvarn_prof_event_pair & pair) {
+        if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+            return false;
+        }
+
+        if (free_events[device].empty() && created_events[device] < max_events_per_device) {
+            ggml_cuda_set_device(device);
+            const int remaining = max_events_per_device - created_events[device];
+            const int n_create = std::min(event_batch, remaining);
+            for (int i = 0; i < n_create; ++i) {
+                kvarn_prof_event_pair cur;
+                cur.device = device;
+                if (cudaEventCreateWithFlags(&cur.ev0, cudaEventDefault) != cudaSuccess) {
+                    break;
+                }
+                if (cudaEventCreateWithFlags(&cur.ev1, cudaEventDefault) != cudaSuccess) {
+                    (void) cudaEventDestroy(cur.ev0);
+                    break;
+                }
+                free_events[device].push_back(cur);
+                ++created_events[device];
+            }
+        }
+
+        if (free_events[device].empty()) {
+            return false;
+        }
+
+        pair = free_events[device].back();
+        free_events[device].pop_back();
+        return true;
+    }
+
+    void release_event_pair_locked(kvarn_prof_event_pair pair) {
+        if (pair.device >= 0 && pair.device < GGML_CUDA_MAX_DEVICES && pair.ev0 != nullptr && pair.ev1 != nullptr) {
+            free_events[pair.device].push_back(pair);
+        }
+    }
+
+    static int n_kv_bucket(int n_kv) {
+        if (n_kv <= 4096) {
+            return 0;
+        }
+        if (n_kv <= 16384) {
+            return 1;
+        }
+        if (n_kv <= 32768) {
+            return 2;
+        }
+        if (n_kv <= 65536) {
+            return 3;
+        }
+        return 4;
+    }
+
+    void accumulate(const kvarn_prof_sample & sample, float ms) {
+        const int side = sample.kind == kvarn_prof_kind::LIVE_GROUPS ? 0 : (sample.side ? 1 : 0);
+        kvarn_prof_bucket & agg = aggregates[(int) sample.kind][side];
+        agg.count += 1;
+        agg.total_ms += ms;
+        agg.max_ms = std::max<double>(agg.max_ms, ms);
+        agg.total_bytes += sample.bytes_out;
+        agg.n_kv_min = std::min(agg.n_kv_min, sample.n_kv);
+        agg.n_kv_max = std::max(agg.n_kv_max, sample.n_kv);
+        agg.n_kv_buckets[n_kv_bucket(sample.n_kv)] += 1;
+    }
+
+    void flush_locked(bool print_after) {
+        if (pending.empty()) {
+            if (print_after) {
+                print_locked();
+            }
+            return;
+        }
+
+        std::array<cudaEvent_t, GGML_CUDA_MAX_DEVICES> latest = {};
+        for (const kvarn_prof_sample & sample : pending) {
+            const int device = sample.events.device;
+            if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+                latest[device] = sample.events.ev1;
+            }
+        }
+
+        std::array<bool, GGML_CUDA_MAX_DEVICES> device_ready = {};
+        for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+            if (latest[device] != nullptr && cudaEventSynchronize(latest[device]) == cudaSuccess) {
+                device_ready[device] = true;
+            }
+        }
+
+        std::vector<kvarn_prof_sample> still_pending;
+        still_pending.reserve(pending.size());
+        for (const kvarn_prof_sample & sample : pending) {
+            const int device = sample.events.device;
+            float ms = 0.0f;
+            if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && device_ready[device] &&
+                    cudaEventElapsedTime(&ms, sample.events.ev0, sample.events.ev1) == cudaSuccess) {
+                accumulate(sample, ms);
+                release_event_pair_locked(sample.events);
+            } else {
+                still_pending.push_back(sample);
+            }
+        }
+        pending.swap(still_pending);
+
+        ++flush_count;
+        const int dump_every = kvarn_profile_dump_every();
+        if (print_after || (dump_every > 0 && flush_count % (uint64_t) dump_every == 0)) {
+            print_locked();
+        }
+    }
+
+    static const char * kind_name(kvarn_prof_kind kind) {
+        switch (kind) {
+            case kvarn_prof_kind::STORE_HI:     return "store_hi   ";
+            case kvarn_prof_kind::STORE_LOW:    return "store_low  ";
+            case kvarn_prof_kind::LIVE_GROUPS:  return "live_groups";
+            case kvarn_prof_kind::MATERIALIZE:  return "materialize";
+            case kvarn_prof_kind::COUNT:        break;
+        }
+        return "unknown    ";
+    }
+
+    void print_locked() const {
+        for (int kind = 0; kind < (int) kvarn_prof_kind::COUNT; ++kind) {
+            const int n_sides = kind == (int) kvarn_prof_kind::LIVE_GROUPS ? 1 : 2;
+            for (int side = 0; side < n_sides; ++side) {
+                const kvarn_prof_bucket & agg = aggregates[kind][side];
+                if (agg.count == 0) {
+                    continue;
+                }
+
+                const double mean_us = 1000.0 * agg.total_ms / (double) agg.count;
+                const double gib = (double) agg.total_bytes / (1024.0 * 1024.0 * 1024.0);
+                const double gbps = agg.total_ms > 0.0 ? gib * 1000.0 / agg.total_ms : 0.0;
+                const int n_kv_min = agg.n_kv_min == INT_MAX ? 0 : agg.n_kv_min;
+                std::fprintf(stderr,
+                        "kvarn-prof: %s %c | count %llu | total %.3f ms | mean %.3f us | max %.3f ms | out %.3f GiB | %.3f GiB/s | n_kv %d..%d | buckets <=4k:%llu <=16k:%llu <=32k:%llu <=64k:%llu >64k:%llu\n",
+                        kind_name((kvarn_prof_kind) kind),
+                        kind == (int) kvarn_prof_kind::LIVE_GROUPS ? '-' : (side == 0 ? 'K' : 'V'),
+                        (unsigned long long) agg.count,
+                        agg.total_ms,
+                        mean_us,
+                        agg.max_ms,
+                        gib,
+                        gbps,
+                        n_kv_min,
+                        agg.n_kv_max,
+                        (unsigned long long) agg.n_kv_buckets[0],
+                        (unsigned long long) agg.n_kv_buckets[1],
+                        (unsigned long long) agg.n_kv_buckets[2],
+                        (unsigned long long) agg.n_kv_buckets[3],
+                        (unsigned long long) agg.n_kv_buckets[4]);
+            }
+        }
+    }
+};
+
+static kvarn_prof_state *& kvarn_prof_state_ptr() {
+    static kvarn_prof_state * state = nullptr;
+    return state;
+}
+
+static void kvarn_prof_dump_atexit() {
+    ggml_cuda_kvarn_profile_dump();
+}
+
+void ggml_cuda_kvarn_profile_dump() {
+    kvarn_prof_state * state = kvarn_prof_state_ptr();
+    if (state == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->final_dump_done && state->pending.empty()) {
+        return;
+    }
+
+    state->flush_locked(true);
+    state->final_dump_done = true;
+}
+
+static kvarn_prof_state * kvarn_prof_get_state() {
+    static std::mutex init_mutex;
+    kvarn_prof_state *& state = kvarn_prof_state_ptr();
+    if (state != nullptr) {
+        return state;
+    }
+
+    std::lock_guard<std::mutex> lock(init_mutex);
+    if (state == nullptr) {
+        state = new kvarn_prof_state();
+        state->pending.reserve(kvarn_prof_state::flush_threshold);
+        std::atexit(kvarn_prof_dump_atexit);
+    }
+    return state;
+}
+
+struct kvarn_prof_scope {
+    kvarn_prof_state * state = nullptr;
+    kvarn_prof_sample sample;
+    bool active = false;
+};
+
+static kvarn_prof_scope kvarn_prof_begin(
+        ggml_backend_cuda_context & ctx,
+        cudaStream_t stream,
+        kvarn_prof_kind kind,
+        bool value,
+        int bits,
+        int n_kv,
+        size_t bytes_out) {
+    if (!kvarn_profile_enabled()) {
+        return {};
+    }
+
+#ifdef USE_CUDA_GRAPH
+    if (ctx.any_cuda_graph_enabled() && !kvarn_profile_cuda_graphs_disabled()) {
+        return {};
+    }
+#endif
+
+    kvarn_prof_state * state = kvarn_prof_get_state();
+    kvarn_prof_scope scope;
+    scope.state = state;
+    scope.sample.kind = kind;
+    scope.sample.side = value ? 1 : 0;
+    scope.sample.bits = (uint8_t) bits;
+    scope.sample.n_kv = n_kv;
+    scope.sample.bytes_out = bytes_out;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->make_event_pair_locked(ctx.device, scope.sample.events)) {
+            state->flush_locked(false);
+            if (!state->make_event_pair_locked(ctx.device, scope.sample.events)) {
+                return {};
+            }
+        }
+    }
+
+    ggml_cuda_set_device(ctx.device);
+    if (cudaEventRecord(scope.sample.events.ev0, stream) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->release_event_pair_locked(scope.sample.events);
+        return {};
+    }
+
+    scope.active = true;
+    return scope;
+}
+
+static void kvarn_prof_end(kvarn_prof_scope & scope, cudaStream_t stream) {
+    if (!scope.active) {
+        return;
+    }
+
+    if (cudaEventRecord(scope.sample.events.ev1, stream) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(scope.state->mutex);
+        scope.state->release_event_pair_locked(scope.sample.events);
+        scope.active = false;
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(scope.state->mutex);
+    scope.state->pending.push_back(scope.sample);
+    scope.active = false;
+    if (scope.state->pending.size() >= kvarn_prof_state::flush_threshold) {
+        scope.state->flush_locked(false);
+    }
+}
 
 static bool ggml_cuda_kvarn_valid_bits(int bits) {
     return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
@@ -636,6 +986,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const char * force_low = std::getenv("GGML_KVARN_FORCE_LOW_SHMEM");
     const bool force_low_shmem = force_low != nullptr && force_low[0] != '\0' && force_low[0] != '0';
     const size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
+    cudaStream_t stream = ctx.stream();
+    const size_t staged_bytes = (size_t) current->ne[0] * (size_t) current->ne[1] * (size_t) current->ne[2] * sizeof(half);
 
     if (!force_low_shmem && smpbo >= KVAR_N_SHARED_BYTES) {
 #if defined(GGML_USE_HIP)
@@ -649,7 +1001,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             KVAR_N_SHARED_BYTES));
 #endif
-        kvarn_store_kernel_hishmem<<<current->ne[1], KVAR_N_DIM, KVAR_N_SHARED_BYTES, ctx.stream()>>>(
+        // CUDA graph caveat: these host-side event records do not run for graph replays.
+        // Use GGML_CUDA_DISABLE_GRAPHS=1 on profiling legs when every launch must be counted.
+        auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, (int) current->ne[2], staged_bytes);
+        kvarn_store_kernel_hishmem<<<current->ne[1], KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
             (half *) stage->data,
@@ -662,9 +1017,11 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value);
+        kvarn_prof_end(prof, stream);
     } else {
         GGML_ASSERT(smpbo >= KVAR_N_LOWSHMEM_BYTES);
-        kvarn_store_kernel_lowshmem<<<current->ne[1], KVAR_N_DIM, KVAR_N_LOWSHMEM_BYTES, ctx.stream()>>>(
+        auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_LOW, value, bits, (int) current->ne[2], staged_bytes);
+        kvarn_store_kernel_lowshmem<<<current->ne[1], KVAR_N_DIM, KVAR_N_LOWSHMEM_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
             (half *) stage->data,
@@ -677,6 +1034,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value);
+        kvarn_prof_end(prof, stream);
     }
 }
 
@@ -699,16 +1057,23 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
     ggml_cuda_pool_alloc<int> live_groups(ctx.pool(), n_stream);
-    kvarn_live_groups_kernel<<<n_stream, KVAR_N_DIM, 0, ctx.stream()>>>(
+    cudaStream_t stream = ctx.stream();
+
+    // CUDA graph caveat: these host-side event records do not run for graph replays.
+    // Use GGML_CUDA_DISABLE_GRAPHS=1 on profiling legs when every launch must be counted.
+    auto prof_live = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::LIVE_GROUPS, false, bits, (int) indices->ne[0], (size_t) n_stream * sizeof(int));
+    kvarn_live_groups_kernel<<<n_stream, KVAR_N_DIM, 0, stream>>>(
         (const int64_t *) indices->data,
         (int) indices->ne[0],
         stream_start,
         n_stream,
         groups_per_stream,
         live_groups.get());
+    kvarn_prof_end(prof_live, stream);
 
     const int blocks = (int) (dst->ne[3] * dst->ne[2] * dst->ne[1]);
-    kvarn_materialize_kernel<<<blocks, KVAR_N_DIM, 0, ctx.stream()>>>(
+    auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
+    kvarn_materialize_kernel<<<blocks, KVAR_N_DIM, 0, stream>>>(
         (const uint8_t *) records->data,
         (const half *) stage->data,
         live_groups.get(),
@@ -720,4 +1085,5 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
         (int) records->ne[0],
         bits,
         value);
+    kvarn_prof_end(prof_mat, stream);
 }

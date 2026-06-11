@@ -14,6 +14,10 @@
 
 using json = nlohmann::ordered_json;
 
+static double server_task_state_copy_mib_per_s(size_t bytes, double ms) {
+    return ms > 0.0 ? (bytes / (1024.0 * 1024.0)) / (ms / 1000.0) : 0.0;
+}
+
 static common_reasoning_loop_guard_mode server_reasoning_loop_guard_mode_from_name(const std::string & value) {
     if (value == "off") {
         return COMMON_REASONING_LOOP_GUARD_OFF;
@@ -2714,13 +2718,21 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
+        const int64_t t_load_start = ggml_time_us();
+        size_t restored_size_tgt = 0;
+        size_t restored_size_dft = 0;
+        const int loaded_tokens = (int) it_best->tokens.size();
+
         {
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
+            restored_size_tgt = size;
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                const double t_load_ms = (ggml_time_us() - t_load_start) / 1000.0;
+                SRV_ERR("failed to restore state with size %zu, took %.1f ms (%.1f MB/s)\n",
+                        size, t_load_ms, server_task_state_copy_mib_per_s(restored_size_tgt + restored_size_dft, t_load_ms));
 
                 return false;
             }
@@ -2736,9 +2748,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 GGML_ASSERT(ctx_dft);
 
                 const size_t size = data.size();
+                restored_size_dft = size;
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    const double t_load_ms = (ggml_time_us() - t_load_start) / 1000.0;
+                    SRV_WRN("failed to restore state with size %zu, took %.1f ms (%.1f MB/s)\n",
+                            size, t_load_ms, server_task_state_copy_mib_per_s(restored_size_tgt + restored_size_dft, t_load_ms));
 
                     return false;
                 }
@@ -2747,6 +2762,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.shrink_to_fit();
             }
         }
+
+        const size_t restored_size = restored_size_tgt + restored_size_dft;
+        const double t_load_ms = (ggml_time_us() - t_load_start) / 1000.0;
+        SRV_INF(" - loaded prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                loaded_tokens, restored_size / (1024.0 * 1024.0), restored_size_dft / (1024.0 * 1024.0),
+                t_load_ms, server_task_state_copy_mib_per_s(restored_size, t_load_ms));
 
         prompt = std::move(*it_best);
 

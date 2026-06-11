@@ -69,6 +69,10 @@ static bool dflash_server_profile_enabled(uint32_t flags) {
     return dflash_profile_enabled(flags);
 }
 
+static double server_state_copy_mib_per_s(size_t bytes, double ms) {
+    return ms > 0.0 ? (bytes / (1024.0 * 1024.0)) / (ms / 1000.0) : 0.0;
+}
+
 static bool dflash_server_crash_trace_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_DFLASH_CRASH_TRACE");
@@ -890,9 +894,7 @@ struct server_slot : server_adaptive_dm_state {
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+        const int64_t t_start = ggml_time_us();
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
@@ -903,6 +905,11 @@ struct server_slot : server_adaptive_dm_state {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+        SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0),
+                t_ms, server_state_copy_mib_per_s(cur_size, t_ms));
 
         return true;
     }
@@ -4135,6 +4142,7 @@ private:
             return;
         }
 
+        const int64_t t_copy_start = ggml_time_us();
         if (cur_size_tgt > 0) {
             const size_t n = llama_state_seq_get_data_ext(
                     ctx_tgt, cur.data_tgt.data(), cur_size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -4165,16 +4173,18 @@ private:
             SLT_INF(slot,
                     "dflash checkpoint: create pos=[%d,%d] n_tokens=%" PRId64
                     " ring_state_bytes=%zu ring_saved=%d\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, ring_size, ring_saved ? 1 : 0);
+                cur.pos_min, cur.pos_max, cur.n_tokens, ring_size, ring_saved ? 1 : 0);
         }
 
+        const double t_copy_ms = (ggml_time_us() - t_copy_start) / 1000.0;
         slot.prompt.checkpoints.push_back(std::move(cur));
         const auto & saved = slot.prompt.checkpoints.back();
 
         SLT_INF(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
                 (int) slot.prompt.checkpoints.size(), max_checkpoints, saved.pos_min,
-                saved.pos_max, saved.n_tokens, (float) saved.size() / 1024 / 1024);
+                saved.pos_max, saved.n_tokens, (float) saved.size() / 1024 / 1024,
+                t_copy_ms, server_state_copy_mib_per_s(saved.size(), t_copy_ms));
     }
 
     void process_single_task(server_task && task) {
@@ -5049,7 +5059,12 @@ private:
 
                         const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                         if (use_ckpt_dft) {
+                            const int64_t t_ckpt_dft_start = ggml_time_us();
                             slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            const double t_ckpt_dft_ms = (ggml_time_us() - t_ckpt_dft_start) / 1000.0;
+                            SLT_DBG(slot, "updated speculative draft checkpoint (size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                                    slot.spec_ckpt.data_dft.size() / (1024.0 * 1024.0),
+                                    t_ckpt_dft_ms, server_state_copy_mib_per_s(slot.spec_ckpt.data_dft.size(), t_ckpt_dft_ms));
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -5257,11 +5272,21 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
 
                 if (use_ckpt_tgt) {
+                    const int64_t t_ckpt_tgt_start = ggml_time_us();
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const double t_ckpt_tgt_ms = (ggml_time_us() - t_ckpt_tgt_start) / 1000.0;
+                    SLT_DBG(slot, "updated speculative target checkpoint (size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                            ckpt.data_tgt.size() / (1024.0 * 1024.0),
+                            t_ckpt_tgt_ms, server_state_copy_mib_per_s(ckpt.data_tgt.size(), t_ckpt_tgt_ms));
                 }
 
                 if (use_ckpt_dft_rs) {
+                    const int64_t t_ckpt_dft_start = ggml_time_us();
                     ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const double t_ckpt_dft_ms = (ggml_time_us() - t_ckpt_dft_start) / 1000.0;
+                    SLT_DBG(slot, "updated speculative draft checkpoint (size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                            ckpt.data_dft.size() / (1024.0 * 1024.0),
+                            t_ckpt_dft_ms, server_state_copy_mib_per_s(ckpt.data_dft.size(), t_ckpt_dft_ms));
                 }
             }
 
@@ -5563,10 +5588,14 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         const size_t checkpoint_size = it->data_tgt.size();
+                                        const int64_t t_restore_start = ggml_time_us();
                                         const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it->data_tgt.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
-                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
+                                            const double t_restore_ms = (ggml_time_us() - t_restore_start) / 1000.0;
+                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                                                    it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024,
+                                                    t_restore_ms, server_state_copy_mib_per_s(checkpoint_size, t_restore_ms));
                                             do_reset = true;
                                         } else {
                                             it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5578,7 +5607,10 @@ private:
                                                 common_speculative_ring_state_load(slot.get_spec(), it->ring_data.data(), it->ring_data.size());
                                             }
 
-                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                            const double t_restore_ms = (ggml_time_us() - t_restore_start) / 1000.0;
+                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                                                    it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024,
+                                                    t_restore_ms, server_state_copy_mib_per_s(it->size(), t_restore_ms));
                                         }
                                     }
 
@@ -6836,6 +6868,7 @@ private:
                             const auto & ckpt = slot.spec_ckpt;
 
                             SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+                            const int64_t t_spec_restore_start = ggml_time_us();
 
                             {
                                 ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -6848,6 +6881,11 @@ private:
 
                                 common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
                             }
+
+                            const double t_spec_restore_ms = (ggml_time_us() - t_spec_restore_start) / 1000.0;
+                            SLT_DBG(slot, "restored speculative checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB), took %.1f ms (%.1f MB/s)\n",
+                                    ckpt.pos_min, ckpt.pos_max, ckpt.size() / (1024.0 * 1024.0),
+                                    t_spec_restore_ms, server_state_copy_mib_per_s(ckpt.size(), t_spec_restore_ms));
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);

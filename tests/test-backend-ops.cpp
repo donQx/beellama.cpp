@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 #include <future>
 #include <fstream>
 #include <memory>
@@ -7207,6 +7208,180 @@ struct test_generic_op : public test_case {
 };
 
 
+static int64_t test_kvarn_record_bytes(int bits) {
+    return (128 * 128 * bits) / 8 + 3 * 128 * (int64_t) sizeof(ggml_fp16_t);
+}
+
+static int test_kvarn_groups_per_stream(int start_idx, int n_tokens) {
+    return std::max(4, (start_idx + n_tokens + 127) / 128);
+}
+
+static void test_kvarn_init_indices(
+        ggml_tensor * indices,
+        int           start_idx,
+        int           n_tokens,
+        int           n_stream,
+        int           groups_per_stream) {
+    std::vector<int64_t> data((size_t) n_tokens * n_stream);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens; ++t) {
+            data[(size_t) s * n_tokens + t] = (int64_t) s * groups_per_stream * 128 + start_idx + t;
+        }
+    }
+    ggml_backend_tensor_set(indices, data.data(), 0, data.size() * sizeof(int64_t));
+}
+
+static void test_kvarn_init_current(ggml_tensor * current, int n_tokens, int n_stream, int n_heads) {
+    std::vector<float> data((size_t) 128 * n_heads * n_tokens * n_stream);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens; ++t) {
+            const int token = s * n_tokens + t;
+            for (int h = 0; h < n_heads; ++h) {
+                for (int d = 0; d < 128; ++d) {
+                    data[((size_t) token * n_heads + h) * 128 + d] =
+                        std::sin(float(d) * 0.071f + float(h) * 0.13f + float(s) * 0.31f) +
+                        std::cos(float(t) * 0.037f + float(h) * 0.11f + float(s) * 0.23f) +
+                        float((d * 13 + h * 7 + t * 17 + s * 19) % 31 - 15) * 0.01f;
+                }
+            }
+        }
+    }
+    ggml_backend_tensor_set(current, data.data(), 0, data.size() * sizeof(float));
+}
+
+static void test_kvarn_zero_tensor(ggml_tensor * tensor) {
+    std::vector<uint8_t> zeros(ggml_nbytes(tensor), 0);
+    ggml_backend_tensor_set(tensor, zeros.data(), 0, zeros.size());
+}
+
+struct test_kvarn_roundtrip : public test_case {
+    int bits;
+    int n_heads;
+    int n_tokens;
+    int start_idx;
+    int n_stream;
+    bool value;
+
+    test_kvarn_roundtrip(int bits, int n_heads, int n_tokens, int start_idx, int n_stream, bool value)
+        : bits(bits), n_heads(n_heads), n_tokens(n_tokens), start_idx(start_idx), n_stream(n_stream), value(value) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(bits, n_heads, n_tokens, start_idx, n_stream, value);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(start_idx, n_tokens);
+        ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, (int64_t) n_tokens * n_stream);
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) n_tokens * n_stream);
+        ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+        ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits), n_heads, groups_per_stream * n_stream);
+
+        ggml_set_name(current, "current");
+        ggml_set_name(indices, "indices");
+        ggml_set_name(stage, "stage");
+        ggml_set_name(records, "records");
+
+        ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, indices, start_idx + n_tokens, 0, n_stream, bits, value);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(start_idx, n_tokens);
+        test_kvarn_init_current(ggml_get_tensor(ctx, "current"), n_tokens, n_stream, n_heads);
+        test_kvarn_init_indices(ggml_get_tensor(ctx, "indices"), start_idx, n_tokens, n_stream, groups_per_stream);
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "records"));
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
+struct test_kvarn_store_only : public test_case {
+    int bits;
+    int n_heads;
+    int n_tokens;
+    int n_stream;
+    bool value;
+
+    test_kvarn_store_only(int bits, int n_heads, int n_tokens, int n_stream, bool value)
+        : bits(bits), n_heads(n_heads), n_tokens(n_tokens), n_stream(n_stream), value(value) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(bits, n_heads, n_tokens, n_stream, value);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_tokens);
+        ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, (int64_t) n_tokens * n_stream);
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) n_tokens * n_stream);
+        ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+        ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits), n_heads, groups_per_stream * n_stream);
+
+        ggml_set_name(current, "current");
+        ggml_set_name(indices, "indices");
+        ggml_set_name(stage, "stage");
+        ggml_set_name(records, "records");
+
+        ggml_tensor * out = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_tokens);
+        test_kvarn_init_current(ggml_get_tensor(ctx, "current"), n_tokens, n_stream, n_heads);
+        test_kvarn_init_indices(ggml_get_tensor(ctx, "indices"), 0, n_tokens, n_stream, groups_per_stream);
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "records"));
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
+struct test_kvarn_materialize_only : public test_case {
+    int bits;
+    int n_heads;
+    int n_kv;
+    int n_stream;
+    bool value;
+
+    test_kvarn_materialize_only(int bits, int n_heads, int n_kv, int n_stream, bool value)
+        : bits(bits), n_heads(n_heads), n_kv(n_kv), n_stream(n_stream), value(value) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(bits, n_heads, n_kv, n_stream, value);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) n_kv * n_stream);
+        ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+        ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits), n_heads, groups_per_stream * n_stream);
+
+        ggml_set_name(indices, "indices");
+        ggml_set_name(stage, "stage");
+        ggml_set_name(records, "records");
+
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stage, indices, n_kv, 0, n_stream, bits, value);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
+        test_kvarn_init_indices(ggml_get_tensor(ctx, "indices"), 0, n_kv, n_stream, groups_per_stream);
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "records"));
+    }
+};
+
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -7748,6 +7923,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (bool v : {false, true}) {
         test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_Q6_0, 256, 5, 4, 1, v));
+    }
+
+    for (int bits : {2, 4, 6, 8}) {
+        for (bool value : {false, true}) {
+            test_cases.emplace_back(new test_kvarn_roundtrip(bits, 1, 128, 0, 1, value));
+            test_cases.emplace_back(new test_kvarn_roundtrip(bits, 1, 127, 256, 1, value));
+            test_cases.emplace_back(new test_kvarn_roundtrip(bits, 1, 640, 0, 1, value));
+        }
+    }
+    for (bool value : {false, true}) {
+        test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 0, 2, value));
+        test_cases.emplace_back(new test_kvarn_store_only(4, 1, 512, 1, value));
     }
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
@@ -9302,6 +9489,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {3072, 512, 2, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_Q4_0, {8192, 512, 2, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32,  {8192, 512, 2, 1}));
+
+    for (int bits : {2, 4, 6, 8}) {
+        for (int n_heads : {8, 16}) {
+            for (int n_stream : {1, 2}) {
+                for (bool value : {false, true}) {
+                    for (int n_tokens : {127, 512, 2048}) {
+                        test_cases.emplace_back(new test_kvarn_store_only(bits, n_heads, n_tokens, n_stream, value));
+                    }
+                    for (int n_kv : {4096, 16384, 32768, 65536}) {
+                        test_cases.emplace_back(new test_kvarn_materialize_only(bits, n_heads, n_kv, n_stream, value));
+                    }
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {768*1024, 256, 1, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768*1024, 256, 1, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
