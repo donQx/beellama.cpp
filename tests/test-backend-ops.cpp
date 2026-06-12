@@ -7927,7 +7927,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_Q6_0, 256, 5, 4, 1, v));
     }
 
-    for (int bits : {2, 4, 6, 8}) {
+    for (int bits : {2, 3, 4, 5, 6, 8}) {
         for (bool value : {false, true}) {
             test_cases.emplace_back(new test_kvarn_roundtrip(bits, 1, 128, 0, 1, value));
             test_cases.emplace_back(new test_kvarn_roundtrip(bits, 1, 127, 256, 1, value));
@@ -9495,7 +9495,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_Q4_0, {8192, 512, 2, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32,  {8192, 512, 2, 1}));
 
-    for (int bits : {2, 4, 6, 8}) {
+    for (int bits : {2, 3, 4, 5, 6, 8}) {
         for (int n_heads : {8, 16}) {
             for (int n_stream : {1, 2}) {
                 for (bool value : {false, true}) {

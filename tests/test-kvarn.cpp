@@ -248,6 +248,18 @@ static void set_kvarn_store_legacy_env(bool enabled) {
 #endif
 }
 
+static void set_kvarn_mat_generic_env(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("GGML_KVARN_MAT_GENERIC", enabled ? "1" : "");
+#else
+    if (enabled) {
+        setenv("GGML_KVARN_MAT_GENERIC", "1", 1);
+    } else {
+        unsetenv("GGML_KVARN_MAT_GENERIC");
+    }
+#endif
+}
+
 static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required, int bits) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -552,6 +564,89 @@ static std::vector<uint8_t> test_store_records(
     return record_data;
 }
 
+static std::vector<ggml_fp16_t> test_materialize_output(
+        ggml_backend_t backend,
+        int            bits,
+        bool           value,
+        bool           generic,
+        int            n_stream,
+        int            n_heads,
+        int            n_tokens_per_stream,
+        int            start_idx) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize materialize parity context");
+
+    const int n_groups_per_stream = std::max(4, (start_idx + n_tokens_per_stream + 127) / 128);
+    const int n_tokens = n_tokens_per_stream * n_stream;
+    const int n_kv = start_idx + n_tokens_per_stream;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
+
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+    stored->op_params[3] = n_tokens_per_stream;
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, indices, n_kv, 0, n_stream, bits, value);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate materialize parity tensors");
+
+    std::vector<float> input(128 * n_heads * n_tokens);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            for (int h = 0; h < n_heads; ++h) {
+                for (int d = 0; d < 128; ++d) {
+                    input[((s * n_tokens_per_stream + t) * n_heads + h) * 128 + d] =
+                        std::sin(float(d) * 0.071f + float(h) * 0.13f + float(s) * 0.31f) +
+                        std::cos(float(t) * 0.037f + float(h) * 0.11f + float(s) * 0.23f) +
+                        float((d * 13 + h * 7 + t * 17 + s * 19) % 31 - 15) * 0.01f;
+                }
+            }
+        }
+    }
+
+    std::vector<int64_t> idx(n_tokens);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + start_idx + t);
+        }
+    }
+
+    std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
+    for (size_t i = 0; i < stage_data.size(); ++i) {
+        const float f = std::sin(float(i) * 0.017f) + std::cos(float(i) * 0.011f);
+        stage_data[i] = ggml_fp32_to_fp16(f);
+    }
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+
+    set_kvarn_mat_generic_env(generic);
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "materialize parity graph compute failed");
+    set_kvarn_mat_generic_env(false);
+
+    std::vector<ggml_fp16_t> output(ggml_nelements(materialized));
+    ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return output;
+}
+
 static void test_store_legacy_parity_gpu() {
     ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (backend == nullptr) {
@@ -588,6 +683,34 @@ static void test_store_legacy_parity_gpu() {
     ggml_backend_free(backend);
 }
 
+static void test_materialize_generic_parity_gpu() {
+    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (backend == nullptr) {
+        return;
+    }
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<ggml_fp16_t> fast = test_materialize_output(
+                    backend, bits, value, false, 2, 2, 385, 64);
+            const std::vector<ggml_fp16_t> generic = test_materialize_output(
+                    backend, bits, value, true, 2, 2, 385, 64);
+            require(fast == generic, "KVarN CUDA materialize fast path differs from generic path");
+        }
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> fast = test_materialize_output(
+                backend, 4, value, false, 1, 2, 17, 504);
+        const std::vector<ggml_fp16_t> generic = test_materialize_output(
+                backend, 4, value, true, 1, 2, 17, 504);
+        require(fast == generic, "KVarN CUDA materialize tail fast path differs from generic path");
+    }
+
+    set_kvarn_mat_generic_env(false);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -618,6 +741,7 @@ int main() {
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
     test_store_legacy_parity_gpu();
+    test_materialize_generic_parity_gpu();
 
     std::printf("test-kvarn: all tests OK\n");
     return 0;

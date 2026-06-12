@@ -17,6 +17,7 @@ static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2;
 static constexpr int KVAR_N_LOWSHMEM_BYTES = KVAR_N_LOWSHMEM_FLOATS * sizeof(float);
 static constexpr int KVAR_N_STAGE_CHUNK = 4;
 static constexpr int KVAR_N_MATERIALIZE_CHUNK = 2;
+static constexpr int KVAR_N_MATERIALIZE_FAST_CHUNK = 16;
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
 static constexpr int KVAR_N_OP_PARAM_VALUE = 2;
@@ -62,6 +63,11 @@ static bool kvarn_store_debug_enabled() {
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
+}
+
+static bool kvarn_materialize_generic_enabled() {
+    const char * v = std::getenv("GGML_KVARN_MAT_GENERIC");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
 struct kvarn_prof_event_pair {
@@ -1351,7 +1357,28 @@ static __global__ void kvarn_materialize_kernel(
     }
 }
 
-static __global__ void kvarn_materialize_k4x4_kernel(
+template<int BITS>
+static __device__ __forceinline__ uint8_t kvarn_unpack_record_fast(const uint8_t * record, int index) {
+    if constexpr (BITS == 8) {
+        return record[index];
+    } else if constexpr (BITS == 4) {
+        const uint8_t packed = record[index >> 1];
+        return (packed >> ((index & 1) * 4)) & 0x0fu;
+    } else if constexpr (BITS == 2) {
+        const uint8_t packed = record[index >> 2];
+        return (packed >> ((index & 3) * 2)) & 0x03u;
+    } else {
+        constexpr int mask = (1 << BITS) - 1;
+        const int bit_offset = index * BITS;
+        const int byte_offset = bit_offset >> 3;
+        const int bit_in_byte = bit_offset & 7;
+        const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
+        return (packed >> bit_in_byte) & mask;
+    }
+}
+
+template<int BITS, bool VALUE, int CHUNK>
+static __global__ void kvarn_materialize_fast_kernel(
         const uint8_t * records,
         const half * stage,
         const int * live_groups,
@@ -1362,79 +1389,250 @@ static __global__ void kvarn_materialize_k4x4_kernel(
         int groups_per_stream,
         int record_bytes) {
     const int head = blockIdx.x;
-    const int dim = threadIdx.x;
-    const int token0 = blockIdx.y * 4;
+    const int token0 = blockIdx.y * CHUNK;
+    const int group = token0 / KVAR_N_DIM;
+    const int pos_base = token0 - group * KVAR_N_DIM;
     const int out_stream = blockIdx.z;
     const int stream = stream_start + out_stream;
+    const int dim = threadIdx.x;
     const int live_group = live_groups[out_stream];
-    __shared__ float rotated[4 * KVAR_N_DIM];
-    float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
+    const bool from_stage = group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group);
+    const bool from_record = !from_stage && group < live_group && group < groups_per_stream;
+    __shared__ float rotated[CHUNK * KVAR_N_DIM];
+    float x[CHUNK] = {};
 
-    if (token0 < n_kv) {
-        const int group = token0 / KVAR_N_DIM;
-        const int pos0 = token0 % KVAR_N_DIM;
-        const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-        if (group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group)) {
+    if (from_record) {
+        const int record_group = stream * groups_per_stream + group;
+        const uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+        constexpr int payload_bytes = KVAR_N_TILE_VALUES * BITS / 8;
+        const half * scale_axis_src = (const half *) (record + payload_bytes);
+        const half * zp_axis_src = scale_axis_src + KVAR_N_DIM;
+        const half * other_axis_src = zp_axis_src + KVAR_N_DIM;
+
+        if constexpr (!VALUE && BITS == 8) {
+            const float s = __half2float(scale_axis_src[dim]);
+            const float z = __half2float(zp_axis_src[dim]);
+            const uint8_t * row_payload = record + dim * KVAR_N_DIM + pos_base;
+            const uint64_t packed_lo = *((const uint64_t *) row_payload);
+            const uint64_t packed_hi = *((const uint64_t *) (row_payload + 8));
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                if (token0 + i < n_kv) {
-                    const int stage_pos = stage_base + (group == 0 ? pos0 + i : KVAR_N_DIM + ((group - 1) & 1) * KVAR_N_DIM + pos0 + i);
-                    x[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
+            for (int j = 0; j < CHUNK / 2; ++j) {
+                const int i0 = j;
+                const int i1 = j + CHUNK / 2;
+                if (token0 + i0 < n_kv) {
+                    const uint8_t q = (packed_lo >> (8 * j)) & 0xffu;
+                    x[i0] = (float(q) * s + z) * __half2float(other_axis_src[pos_base + i0]);
+                }
+                if (token0 + i1 < n_kv) {
+                    const uint8_t q = (packed_hi >> (8 * j)) & 0xffu;
+                    x[i1] = (float(q) * s + z) * __half2float(other_axis_src[pos_base + i1]);
                 }
             }
-        } else if (group < live_group && group < groups_per_stream) {
-            const int record_group = stream * groups_per_stream + group;
-            const uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
-            const int payload_bytes = KVAR_N_TILE_VALUES * 4 / 8;
-            const half * scale_axis = (const half *) (record + payload_bytes);
-            const half * zp_axis = scale_axis + KVAR_N_DIM;
-            const half * other_axis = zp_axis + KVAR_N_DIM;
-            const uint8_t packed0 = record[dim * (KVAR_N_DIM / 2) + (pos0 >> 1)];
-            const uint8_t packed1 = record[dim * (KVAR_N_DIM / 2) + (pos0 >> 1) + 1];
-            const float s = __half2float(scale_axis[dim]);
-            const float z = __half2float(zp_axis[dim]);
-            x[0] = ((packed0 & 0x0fu) * s + z) * __half2float(other_axis[pos0]);
-            if (token0 + 1 < n_kv) {
-                x[1] = (((packed0 >> 4) & 0x0fu) * s + z) * __half2float(other_axis[pos0 + 1]);
+        } else if constexpr (!VALUE && BITS == 4) {
+            const float s = __half2float(scale_axis_src[dim]);
+            const float z = __half2float(zp_axis_src[dim]);
+            const uint8_t * row_payload = record + dim * (KVAR_N_DIM / 2) + (pos_base >> 1);
+            const uint64_t packed_row = *((const uint64_t *) row_payload);
+#pragma unroll
+            for (int j = 0; j < CHUNK / 2; ++j) {
+                const uint8_t packed = (packed_row >> (8 * j)) & 0xffu;
+                const int i0 = 2 * j;
+                const int i1 = i0 + 1;
+                if (token0 + i0 < n_kv) {
+                    x[i0] = ((packed & 0x0fu) * s + z) * __half2float(other_axis_src[pos_base + i0]);
+                }
+                if (token0 + i1 < n_kv) {
+                    x[i1] = (((packed >> 4) & 0x0fu) * s + z) * __half2float(other_axis_src[pos_base + i1]);
+                }
             }
-            if (token0 + 2 < n_kv) {
-                x[2] = ((packed1 & 0x0fu) * s + z) * __half2float(other_axis[pos0 + 2]);
+        } else if constexpr (!VALUE && BITS == 2) {
+            const float s = __half2float(scale_axis_src[dim]);
+            const float z = __half2float(zp_axis_src[dim]);
+            const uint8_t * row_payload = record + dim * (KVAR_N_DIM / 4) + (pos_base >> 2);
+#pragma unroll
+            for (int j = 0; j < CHUNK / 4; ++j) {
+                const uint8_t packed = row_payload[j];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int i = 4 * j + k;
+                    if (token0 + i < n_kv) {
+                        const uint8_t q = (packed >> (2 * k)) & 0x03u;
+                        x[i] = (float(q) * s + z) * __half2float(other_axis_src[pos_base + i]);
+                    }
+                }
             }
-            if (token0 + 3 < n_kv) {
-                x[3] = (((packed1 >> 4) & 0x0fu) * s + z) * __half2float(other_axis[pos0 + 3]);
+        } else if constexpr (VALUE && BITS == 4) {
+            const float other = __half2float(other_axis_src[dim]);
+            const int lane = threadIdx.x & 31;
+#pragma unroll
+            for (int i = 0; i < CHUNK; ++i) {
+                const int pos = pos_base + i;
+                const int token = token0 + i;
+                if (token < n_kv) {
+                    uint8_t packed = 0;
+                    if ((dim & 1) == 0) {
+                        packed = record[pos * (KVAR_N_DIM / 2) + (dim >> 1)];
+                    }
+                    packed = __shfl_sync(0xffffffffu, packed, lane & ~1);
+                    const uint8_t q = (packed >> ((dim & 1) * 4)) & 0x0fu;
+                    x[i] = (float(q) * __half2float(scale_axis_src[pos]) + __half2float(zp_axis_src[pos])) * other;
+                }
+            }
+        } else if constexpr (VALUE && BITS == 2) {
+            const float other = __half2float(other_axis_src[dim]);
+            const int lane = threadIdx.x & 31;
+#pragma unroll
+            for (int i = 0; i < CHUNK; ++i) {
+                const int pos = pos_base + i;
+                const int token = token0 + i;
+                if (token < n_kv) {
+                    uint8_t packed = 0;
+                    if ((dim & 3) == 0) {
+                        packed = record[pos * (KVAR_N_DIM / 4) + (dim >> 2)];
+                    }
+                    packed = __shfl_sync(0xffffffffu, packed, lane & ~3);
+                    const uint8_t q = (packed >> ((dim & 3) * 2)) & 0x03u;
+                    x[i] = (float(q) * __half2float(scale_axis_src[pos]) + __half2float(zp_axis_src[pos])) * other;
+                }
+            }
+        } else if constexpr (!VALUE) {
+            const float s = __half2float(scale_axis_src[dim]);
+            const float z = __half2float(zp_axis_src[dim]);
+            constexpr int segment_bytes = CHUNK * BITS / 8;
+            const uint8_t * row_payload = record + dim * (KVAR_N_DIM * BITS / 8) + (pos_base * BITS / 8);
+            uint64_t packed_lo = 0;
+            uint64_t packed_hi = 0;
+#pragma unroll
+            for (int b = 0; b < segment_bytes; ++b) {
+                if (b < 8) {
+                    packed_lo |= (uint64_t) row_payload[b] << (8 * b);
+                } else {
+                    packed_hi |= (uint64_t) row_payload[b] << (8 * (b - 8));
+                }
+            }
+            constexpr int mask = (1 << BITS) - 1;
+#pragma unroll
+            for (int i = 0; i < CHUNK; ++i) {
+                const int token = token0 + i;
+                if (token < n_kv) {
+                    const int bit_offset = i * BITS;
+                    uint64_t shifted;
+                    if constexpr (segment_bytes <= 8) {
+                        shifted = packed_lo >> bit_offset;
+                    } else {
+                        if (bit_offset == 0) {
+                            shifted = packed_lo;
+                        } else if (bit_offset < 64) {
+                            shifted = (packed_lo >> bit_offset) | (packed_hi << (64 - bit_offset));
+                        } else {
+                            shifted = packed_hi >> (bit_offset - 64);
+                        }
+                    }
+                    const uint8_t q = shifted & mask;
+                    x[i] = (float(q) * s + z) * __half2float(other_axis_src[pos_base + i]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < CHUNK; ++i) {
+                const int pos = pos_base + i;
+                const int token = token0 + i;
+                if (token < n_kv) {
+                    const int row = pos;
+                    const int col = dim;
+                    const uint8_t q = kvarn_unpack_record_fast<BITS>(record, row * KVAR_N_DIM + col);
+                    x[i] = (float(q) * __half2float(scale_axis_src[row]) + __half2float(zp_axis_src[row])) *
+                        __half2float(other_axis_src[col]);
+                }
+            }
+        }
+    } else if (from_stage) {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const int pos = pos_base + i;
+            const int token = token0 + i;
+            if (token < n_kv) {
+                const int stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + ((group - 1) & 1) * KVAR_N_DIM + pos);
+                x[i] = __half2float(stage[((int64_t) stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
             }
         }
     }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int stride = 1; stride < 32; stride *= 2) {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const float other = __shfl_xor_sync(0xffffffffu, x[i], stride);
+            x[i] = (dim & stride) == 0 ? x[i] + other : other - x[i];
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) {
         rotated[i * KVAR_N_DIM + dim] = x[i];
     }
     __syncthreads();
-    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
-        if (dim < 64) {
-            const int j = (dim / stride) * (2 * stride) + (dim % stride);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float * values = rotated + i * KVAR_N_DIM;
-                const float a = values[j];
-                const float b = values[j + stride];
-                values[j] = a + b;
-                values[j + stride] = a - b;
-            }
-        }
-        __syncthreads();
+    for (int i = 0; i < CHUNK; ++i) {
+        x[i] = (dim & 32) == 0 ?
+            x[i] + rotated[i * KVAR_N_DIM + dim + 32] :
+            rotated[i * KVAR_N_DIM + dim - 32] - x[i];
     }
+    __syncthreads();
+
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        if (token0 + i < n_kv) {
-            dst[((out_stream * n_kv + token0 + i) * n_heads + head) * KVAR_N_DIM + dim] =
-                __float2half_rn(rotated[i * KVAR_N_DIM + dim] * 0.08838834764831845f);
+    for (int i = 0; i < CHUNK; ++i) {
+        rotated[i * KVAR_N_DIM + dim] = x[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) {
+        x[i] = dim < 64 ?
+            x[i] + rotated[i * KVAR_N_DIM + dim + 64] :
+            rotated[i * KVAR_N_DIM + dim - 64] - x[i];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) {
+        const int token = token0 + i;
+        if (token < n_kv) {
+            half * out = dst + ((int64_t) out_stream * n_kv * n_heads + (int64_t) token * n_heads + head) * KVAR_N_DIM;
+            out[dim] = __float2half_rn(x[i] * 0.08838834764831845f);
         }
     }
 }
 
-static __global__ void kvarn_materialize_v4x4_kernel(
+template<int BITS, bool VALUE>
+static void kvarn_launch_materialize_fast(
+        const uint8_t * records,
+        const half * stage,
+        const int * live_groups,
+        half * dst,
+        int n_heads,
+        int n_kv,
+        int n_stream,
+        int stream_start,
+        int groups_per_stream,
+        int record_bytes,
+        cudaStream_t stream) {
+    const int n_chunks = (n_kv + KVAR_N_MATERIALIZE_FAST_CHUNK - 1) / KVAR_N_MATERIALIZE_FAST_CHUNK;
+    dim3 blocks((uint32_t) n_heads, (uint32_t) n_chunks, (uint32_t) n_stream);
+    kvarn_materialize_fast_kernel<BITS, VALUE, KVAR_N_MATERIALIZE_FAST_CHUNK><<<blocks, KVAR_N_DIM, 0, stream>>>(
+        records,
+        stage,
+        live_groups,
+        dst,
+        n_heads,
+        n_kv,
+        stream_start,
+        groups_per_stream,
+        record_bytes);
+}
+
+template<int CHUNK>
+static __global__ void kvarn_materialize_v4_pair_kernel(
         const uint8_t * records,
         const half * stage,
         const int * live_groups,
@@ -1445,80 +1643,129 @@ static __global__ void kvarn_materialize_v4x4_kernel(
         int groups_per_stream,
         int record_bytes) {
     const int head = blockIdx.x;
-    const int hdim = threadIdx.x;
-    const int dim0 = hdim * 2;
-    const int dim1 = dim0 + 1;
-    const int token0 = blockIdx.y * 4;
+    const int token0 = blockIdx.y * CHUNK;
+    const int group = token0 / KVAR_N_DIM;
+    const int pos_base = token0 - group * KVAR_N_DIM;
     const int out_stream = blockIdx.z;
     const int stream = stream_start + out_stream;
+    const int hdim = threadIdx.x;
+    const int dim0 = 2 * hdim;
+    const int dim1 = dim0 + 1;
     const int live_group = live_groups[out_stream];
-    __shared__ float rotated[4 * KVAR_N_DIM];
-    float x0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    float x1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
+    const bool from_stage = group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group);
+    const bool from_record = !from_stage && group < live_group && group < groups_per_stream;
+    __shared__ float rotated[CHUNK * KVAR_N_DIM];
+    float x0[CHUNK] = {};
+    float x1[CHUNK] = {};
 
-    if (token0 < n_kv) {
-        const int group = token0 / KVAR_N_DIM;
-        const int pos0 = token0 % KVAR_N_DIM;
-        const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-        if (group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group)) {
+    if (from_record) {
+        const int record_group = stream * groups_per_stream + group;
+        const uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+        constexpr int payload_bytes = KVAR_N_TILE_VALUES * 4 / 8;
+        const half * scale_axis = (const half *) (record + payload_bytes);
+        const half * zp_axis = scale_axis + KVAR_N_DIM;
+        const half * other_axis = zp_axis + KVAR_N_DIM;
+        const float other0 = __half2float(other_axis[dim0]);
+        const float other1 = __half2float(other_axis[dim1]);
+
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                if (token0 + i < n_kv) {
-                    const int stage_pos = stage_base + (group == 0 ? pos0 + i : KVAR_N_DIM + ((group - 1) & 1) * KVAR_N_DIM + pos0 + i);
-                    const half * src = stage + (stage_pos * n_heads + head) * KVAR_N_DIM;
-                    x0[i] = __half2float(src[dim0]);
-                    x1[i] = __half2float(src[dim1]);
-                }
+        for (int i = 0; i < CHUNK; ++i) {
+            const int pos = pos_base + i;
+            const int token = token0 + i;
+            if (token < n_kv) {
+                const float s = __half2float(scale_axis[pos]);
+                const float z = __half2float(zp_axis[pos]);
+                const uint8_t packed = record[pos * (KVAR_N_DIM / 2) + hdim];
+                x0[i] = ((packed & 0x0fu) * s + z) * other0;
+                x1[i] = (((packed >> 4) & 0x0fu) * s + z) * other1;
             }
-        } else if (group < live_group && group < groups_per_stream) {
-            const int record_group = stream * groups_per_stream + group;
-            const uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
-            const int payload_bytes = KVAR_N_TILE_VALUES * 4 / 8;
-            const half * scale_axis = (const half *) (record + payload_bytes);
-            const half * zp_axis = scale_axis + KVAR_N_DIM;
-            const half * other_axis = zp_axis + KVAR_N_DIM;
-            const float other0 = __half2float(other_axis[dim0]);
-            const float other1 = __half2float(other_axis[dim1]);
+        }
+    } else if (from_stage) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                if (token0 + i < n_kv) {
-                    const int pos = pos0 + i;
-                    const uint8_t packed = record[pos * (KVAR_N_DIM / 2) + hdim];
-                    const float s = __half2float(scale_axis[pos]);
-                    const float z = __half2float(zp_axis[pos]);
-                    x0[i] = ((packed & 0x0fu) * s + z) * other0;
-                    x1[i] = (((packed >> 4) & 0x0fu) * s + z) * other1;
-                }
+        for (int i = 0; i < CHUNK; ++i) {
+            const int pos = pos_base + i;
+            const int token = token0 + i;
+            if (token < n_kv) {
+                const int stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + ((group - 1) & 1) * KVAR_N_DIM + pos);
+                const half * src = stage + ((int64_t) stage_pos * n_heads + head) * KVAR_N_DIM;
+                x0[i] = __half2float(src[dim0]);
+                x1[i] = __half2float(src[dim1]);
             }
         }
     }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < CHUNK; ++i) {
+        const float a = x0[i];
+        const float b = x1[i];
+        x0[i] = a + b;
+        x1[i] = a - b;
+    }
+
+#pragma unroll
+    for (int stride = 2; stride < 64; stride *= 2) {
+        const int partner = stride / 2;
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const float y0 = __shfl_xor_sync(0xffffffffu, x0[i], partner);
+            const float y1 = __shfl_xor_sync(0xffffffffu, x1[i], partner);
+            x0[i] = (hdim & partner) == 0 ? x0[i] + y0 : y0 - x0[i];
+            x1[i] = (hdim & partner) == 0 ? x1[i] + y1 : y1 - x1[i];
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) {
         rotated[i * KVAR_N_DIM + dim0] = x0[i];
         rotated[i * KVAR_N_DIM + dim1] = x1[i];
     }
     __syncthreads();
-    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
-        const int j = (hdim / stride) * (2 * stride) + (hdim % stride);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            float * values = rotated + i * KVAR_N_DIM;
-            const float a = values[j];
-            const float b = values[j + stride];
-            values[j] = a + b;
-            values[j + stride] = a - b;
-        }
-        __syncthreads();
+    for (int i = 0; i < CHUNK; ++i) {
+        const float y0 = rotated[i * KVAR_N_DIM + (dim0 ^ 64)];
+        const float y1 = rotated[i * KVAR_N_DIM + (dim1 ^ 64)];
+        x0[i] = hdim < 32 ? x0[i] + y0 : y0 - x0[i];
+        x1[i] = hdim < 32 ? x1[i] + y1 : y1 - x1[i];
     }
+    __syncthreads();
+
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        if (token0 + i < n_kv) {
-            half * out = dst + ((out_stream * n_kv + token0 + i) * n_heads + head) * KVAR_N_DIM;
-            out[dim0] = __float2half_rn(rotated[i * KVAR_N_DIM + dim0] * 0.08838834764831845f);
-            out[dim1] = __float2half_rn(rotated[i * KVAR_N_DIM + dim1] * 0.08838834764831845f);
+    for (int i = 0; i < CHUNK; ++i) {
+        const int token = token0 + i;
+        if (token < n_kv) {
+            half * out = dst + ((int64_t) out_stream * n_kv * n_heads + (int64_t) token * n_heads + head) * KVAR_N_DIM;
+            *((half2 *) (out + dim0)) = __halves2half2(
+                __float2half_rn(x0[i] * 0.08838834764831845f),
+                __float2half_rn(x1[i] * 0.08838834764831845f));
         }
     }
+}
+
+static void kvarn_launch_materialize_v4_pair(
+        const uint8_t * records,
+        const half * stage,
+        const int * live_groups,
+        half * dst,
+        int n_heads,
+        int n_kv,
+        int n_stream,
+        int stream_start,
+        int groups_per_stream,
+        int record_bytes,
+        cudaStream_t stream) {
+    const int n_chunks = (n_kv + KVAR_N_MATERIALIZE_FAST_CHUNK - 1) / KVAR_N_MATERIALIZE_FAST_CHUNK;
+    dim3 blocks((uint32_t) n_heads, (uint32_t) n_chunks, (uint32_t) n_stream);
+    kvarn_materialize_v4_pair_kernel<KVAR_N_MATERIALIZE_FAST_CHUNK><<<blocks, KVAR_N_DIM / 2, 0, stream>>>(
+        records,
+        stage,
+        live_groups,
+        dst,
+        n_heads,
+        n_kv,
+        stream_start,
+        groups_per_stream,
+        record_bytes);
 }
 
 void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1793,31 +2040,69 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     kvarn_prof_end(prof_live, stream);
 
     auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
-    if (bits == 4 && !value) {
-        dim3 blocks4((uint32_t) dst->ne[1], (uint32_t) ((dst->ne[2] + 3) / 4), (uint32_t) dst->ne[3]);
-        kvarn_materialize_k4x4_kernel<<<blocks4, KVAR_N_DIM, 0, stream>>>(
-            (const uint8_t *) records->data,
-            (const half *) stage->data,
-            live_groups.get(),
-            (half *) dst->data,
-            (int) dst->ne[1],
-            (int) dst->ne[2],
-            stream_start,
-            groups_per_stream,
-            (int) records->ne[0]);
-    } else if (bits == 4 && value) {
-        dim3 blocks4((uint32_t) dst->ne[1], (uint32_t) ((dst->ne[2] + 3) / 4), (uint32_t) dst->ne[3]);
-        kvarn_materialize_v4x4_kernel<<<blocks4, KVAR_N_DIM / 2, 0, stream>>>(
-            (const uint8_t *) records->data,
-            (const half *) stage->data,
-            live_groups.get(),
-            (half *) dst->data,
-            (int) dst->ne[1],
-            (int) dst->ne[2],
-            stream_start,
-            groups_per_stream,
-            (int) records->ne[0]);
-    } else {
+    bool use_fast_materialize = !kvarn_materialize_generic_enabled();
+    if (use_fast_materialize) {
+        switch (bits) {
+            case 2:
+                if (value) {
+                    kvarn_launch_materialize_fast<2, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<2, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            case 3:
+                if (value) {
+                    kvarn_launch_materialize_fast<3, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<3, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            case 4:
+                if (value) {
+                    kvarn_launch_materialize_v4_pair((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<4, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            case 5:
+                if (value) {
+                    kvarn_launch_materialize_fast<5, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<5, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            case 6:
+                if (value) {
+                    kvarn_launch_materialize_fast<6, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<6, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            case 8:
+                if (value) {
+                    kvarn_launch_materialize_fast<8, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                } else {
+                    kvarn_launch_materialize_fast<8, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                }
+                break;
+            default:
+                use_fast_materialize = false;
+                break;
+        }
+    }
+    if (!use_fast_materialize) {
         dim3 blocks((uint32_t) dst->ne[1], (uint32_t) ((dst->ne[2] + KVAR_N_MATERIALIZE_CHUNK - 1) / KVAR_N_MATERIALIZE_CHUNK), (uint32_t) dst->ne[3]);
         kvarn_materialize_kernel<<<blocks, KVAR_N_DIM * KVAR_N_MATERIALIZE_CHUNK, 0, stream>>>(
             (const uint8_t *) records->data,
