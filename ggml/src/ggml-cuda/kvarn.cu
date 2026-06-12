@@ -21,7 +21,6 @@ static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
 static constexpr int KVAR_N_OP_PARAM_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
-static constexpr int KVAR_N_OP_PARAM_LIVE_GROUP_HINT = 4;
 
 enum class kvarn_prof_kind : uint8_t {
     STORE_HI = 0,
@@ -55,6 +54,14 @@ static int kvarn_profile_dump_every() {
 static bool kvarn_profile_cuda_graphs_disabled() {
     static const bool disabled = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
     return disabled;
+}
+
+static bool kvarn_store_debug_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("GGML_KVARN_STORE_DEBUG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
 }
 
 struct kvarn_prof_event_pair {
@@ -820,9 +827,13 @@ static __global__ void kvarn_store_kernel_hishmem(
         int record_bytes,
         int bits,
         int iterations,
-        bool value) {
+        bool value,
+        const int * skip_if_workspace_valid) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
+    if (skip_if_workspace_valid != nullptr && skip_if_workspace_valid[0] != 0) {
+        return;
+    }
 
     for (int token = 0; token < n_tokens; ++token) {
         const int64_t idx = indices[token];
@@ -1012,11 +1023,70 @@ static __global__ void kvarn_store_workspace_stage_kernel(
     }
 }
 
+static __global__ void kvarn_store_workspace_validate_kernel(
+        const int64_t * indices,
+        int n_tokens,
+        int n_stream,
+        int groups_per_stream,
+        int tokens_per_stream,
+        int active_streams,
+        int * workspace_valid) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+
+    __shared__ int valid;
+    if (threadIdx.x == 0) {
+        valid =
+        tokens_per_stream > 0 &&
+        active_streams > 0 &&
+        active_streams <= n_stream &&
+        n_tokens == active_streams * tokens_per_stream ? 1 : 0;
+    }
+    __syncthreads();
+
+    for (int active_stream = 0; active_stream < active_streams; ++active_stream) {
+        if (valid == 0) {
+            break;
+        }
+        const int token_base = active_stream * tokens_per_stream;
+        const int64_t first_idx = indices[token_base];
+
+        for (int t = threadIdx.x; t < tokens_per_stream; t += blockDim.x) {
+            if (indices[token_base + t] != first_idx + t) {
+                atomicExch(&valid, 0);
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0 && valid != 0) {
+            const int first_group_global = (int) (first_idx / KVAR_N_DIM);
+            const int stream = first_group_global / groups_per_stream;
+            const int first_group = first_group_global - stream * groups_per_stream;
+            const int first_pos = (int) (first_idx % KVAR_N_DIM);
+            const int start_local = first_group * KVAR_N_DIM + first_pos;
+            const int end_local = start_local + tokens_per_stream;
+            if (stream < 0 || stream >= n_stream ||
+                    first_group < 0 || first_group >= groups_per_stream ||
+                    first_pos < 0 || first_pos >= KVAR_N_DIM ||
+                    end_local > groups_per_stream * KVAR_N_DIM) {
+                valid = 0;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        workspace_valid[0] = valid;
+    }
+}
+
 static __global__ void kvarn_store_workspace_flush_kernel(
         const int64_t * indices,
         const half * stage,
         const half * workspace,
         uint8_t * records,
+        const int * workspace_valid,
         int n_heads,
         int n_tokens,
         int n_stream,
@@ -1032,7 +1102,7 @@ static __global__ void kvarn_store_workspace_flush_kernel(
     const int active_stream = blockIdx.y / flush_candidates;
     const int candidate = blockIdx.y - active_stream * flush_candidates;
     const int token_base = active_stream * tokens_per_stream;
-    if (head >= n_heads || token_base >= n_tokens || tokens_per_stream <= 0) {
+    if ((workspace_valid != nullptr && workspace_valid[0] == 0) || head >= n_heads || token_base >= n_tokens || tokens_per_stream <= 0) {
         return;
     }
 
@@ -1091,6 +1161,7 @@ static __global__ void kvarn_store_workspace_commit_kernel(
         const int64_t * indices,
         const half * workspace,
         half * stage,
+        const int * workspace_valid,
         int n_heads,
         int n_tokens,
         int n_stream,
@@ -1100,7 +1171,7 @@ static __global__ void kvarn_store_workspace_commit_kernel(
     const int active_stream = blockIdx.y / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS);
     const int stage_local = blockIdx.y - active_stream * (KVAR_N_DIM * KVAR_N_STAGE_GROUPS);
     const int token_base = active_stream * tokens_per_stream;
-    if (head >= n_heads || token_base >= n_tokens || tokens_per_stream <= 0) {
+    if ((workspace_valid != nullptr && workspace_valid[0] == 0) || head >= n_heads || token_base >= n_tokens || tokens_per_stream <= 0) {
         return;
     }
 
@@ -1229,8 +1300,7 @@ static __global__ void kvarn_materialize_kernel(
         int groups_per_stream,
         int record_bytes,
         int bits,
-        bool value,
-        int live_group_hint) {
+        bool value) {
     const int head = blockIdx.x;
     const int lane = threadIdx.x / KVAR_N_DIM;
     const int dim = threadIdx.x - lane * KVAR_N_DIM;
@@ -1239,7 +1309,7 @@ static __global__ void kvarn_materialize_kernel(
     const int stream = stream_start + out_stream;
     __shared__ float rotated[KVAR_N_MATERIALIZE_CHUNK * KVAR_N_DIM];
     float * rotated_lane = rotated + lane * KVAR_N_DIM;
-    const int live_group = live_group_hint >= 0 ? live_group_hint : live_groups[out_stream];
+    const int live_group = live_groups[out_stream];
 
     float x = 0.0f;
     if (token < n_kv) {
@@ -1290,14 +1360,13 @@ static __global__ void kvarn_materialize_k4x4_kernel(
         int n_kv,
         int stream_start,
         int groups_per_stream,
-        int record_bytes,
-        int live_group_hint) {
+        int record_bytes) {
     const int head = blockIdx.x;
     const int dim = threadIdx.x;
     const int token0 = blockIdx.y * 4;
     const int out_stream = blockIdx.z;
     const int stream = stream_start + out_stream;
-    const int live_group = live_group_hint >= 0 ? live_group_hint : live_groups[out_stream];
+    const int live_group = live_groups[out_stream];
     __shared__ float rotated[4 * KVAR_N_DIM];
     float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -1374,8 +1443,7 @@ static __global__ void kvarn_materialize_v4x4_kernel(
         int n_kv,
         int stream_start,
         int groups_per_stream,
-        int record_bytes,
-        int live_group_hint) {
+        int record_bytes) {
     const int head = blockIdx.x;
     const int hdim = threadIdx.x;
     const int dim0 = hdim * 2;
@@ -1383,7 +1451,7 @@ static __global__ void kvarn_materialize_v4x4_kernel(
     const int token0 = blockIdx.y * 4;
     const int out_stream = blockIdx.z;
     const int stream = stream_start + out_stream;
-    const int live_group = live_group_hint >= 0 ? live_group_hint : live_groups[out_stream];
+    const int live_group = live_groups[out_stream];
     __shared__ float rotated[4 * KVAR_N_DIM];
     float x0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float x1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -1514,14 +1582,42 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             reinterpret_cast<const void *>(&kvarn_store_workspace_flush_kernel),
             hipFuncAttributeMaxDynamicSharedMemorySize,
             KVAR_N_SHARED_BYTES));
+        CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void *>(&kvarn_store_kernel_hishmem),
+            hipFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
 #elif !defined(GGML_USE_MUSA)
         CUDA_CHECK(cudaFuncSetAttribute(
             kvarn_store_workspace_flush_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             KVAR_N_SHARED_BYTES));
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kvarn_store_kernel_hishmem,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            KVAR_N_SHARED_BYTES));
 #endif
         ggml_cuda_pool_alloc<half> workspace(ctx.pool(), (size_t) n_tokens * (size_t) n_heads * KVAR_N_DIM);
+        ggml_cuda_pool_alloc<int> workspace_valid(ctx.pool(), 1);
         auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, n_tokens, staged_bytes);
+        kvarn_store_workspace_validate_kernel<<<1, 256, 0, stream>>>(
+            (const int64_t *) indices->data,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            tokens_per_stream_hint,
+            active_streams,
+            workspace_valid.get());
+        if (kvarn_store_debug_enabled()) {
+            int valid_host = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&valid_host, workspace_valid.get(), sizeof(valid_host), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (valid_host == 0) {
+                std::fprintf(stderr,
+                    "ggml-cuda: KVarN workspace store hint mismatch; falling back to legacy store "
+                    "(tokens=%d, hint=%d, streams=%d)\n",
+                    n_tokens, tokens_per_stream_hint, n_stream);
+            }
+        }
         dim3 blocks_stage(n_heads, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
         kvarn_store_workspace_stage_kernel<<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
             (const float *) current->data,
@@ -1534,6 +1630,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (const half *) stage->data,
             workspace.get(),
             (uint8_t *) records->data,
+            workspace_valid.get(),
             n_heads,
             n_tokens,
             n_stream,
@@ -1549,11 +1646,26 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (const int64_t *) indices->data,
             workspace.get(),
             (half *) stage->data,
+            workspace_valid.get(),
             n_heads,
             n_tokens,
             n_stream,
             groups_per_stream,
             tokens_per_stream_hint);
+        kvarn_store_kernel_hishmem<<<n_heads, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+            (const float *) current->data,
+            (const int64_t *) indices->data,
+            (half *) stage->data,
+            (uint8_t *) records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int) records->ne[0],
+            bits,
+            iterations,
+            value,
+            workspace_valid.get());
         kvarn_prof_end(prof, stream);
         return;
     }
@@ -1624,7 +1736,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (int) records->ne[0],
             bits,
             iterations,
-            value);
+            value,
+            nullptr);
         kvarn_prof_end(prof, stream);
     } else {
         GGML_ASSERT(smpbo >= KVAR_N_LOWSHMEM_BYTES);
@@ -1659,29 +1772,25 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
-    const int live_group_hint = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_LIVE_GROUP_HINT);
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
-    ggml_cuda_pool_alloc<int> live_groups(ctx.pool());
+    ggml_cuda_pool_alloc<int> live_groups(ctx.pool(), n_stream);
     cudaStream_t stream = ctx.stream();
 
-    if (live_group_hint < 0) {
-        live_groups.alloc(n_stream);
-        // CUDA graph caveat: these host-side event records do not run for graph replays.
-        // Use GGML_CUDA_DISABLE_GRAPHS=1 on profiling legs when every launch must be counted.
-        auto prof_live = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::LIVE_GROUPS, false, bits, (int) indices->ne[0], (size_t) n_stream * sizeof(int));
-        kvarn_live_groups_kernel<<<n_stream, KVAR_N_DIM, 0, stream>>>(
-            (const int64_t *) indices->data,
-            (int) indices->ne[0],
-            stream_start,
-            n_stream,
-            groups_per_stream,
-            live_groups.get());
-        kvarn_prof_end(prof_live, stream);
-    }
+    // op_params are frozen into reusable graphs. The live group depends on the
+    // current indices input tensor, so compute it on device every execution.
+    auto prof_live = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::LIVE_GROUPS, false, bits, (int) indices->ne[0], (size_t) n_stream * sizeof(int));
+    kvarn_live_groups_kernel<<<n_stream, KVAR_N_DIM, 0, stream>>>(
+        (const int64_t *) indices->data,
+        (int) indices->ne[0],
+        stream_start,
+        n_stream,
+        groups_per_stream,
+        live_groups.get());
+    kvarn_prof_end(prof_live, stream);
 
     auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
     if (bits == 4 && !value) {
@@ -1695,8 +1804,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
             (int) dst->ne[2],
             stream_start,
             groups_per_stream,
-            (int) records->ne[0],
-            live_group_hint);
+            (int) records->ne[0]);
     } else if (bits == 4 && value) {
         dim3 blocks4((uint32_t) dst->ne[1], (uint32_t) ((dst->ne[2] + 3) / 4), (uint32_t) dst->ne[3]);
         kvarn_materialize_v4x4_kernel<<<blocks4, KVAR_N_DIM / 2, 0, stream>>>(
@@ -1708,8 +1816,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
             (int) dst->ne[2],
             stream_start,
             groups_per_stream,
-            (int) records->ne[0],
-            live_group_hint);
+            (int) records->ne[0]);
     } else {
         dim3 blocks((uint32_t) dst->ne[1], (uint32_t) ((dst->ne[2] + KVAR_N_MATERIALIZE_CHUNK - 1) / KVAR_N_MATERIALIZE_CHUNK), (uint32_t) dst->ne[3]);
         kvarn_materialize_kernel<<<blocks, KVAR_N_DIM * KVAR_N_MATERIALIZE_CHUNK, 0, stream>>>(
@@ -1723,8 +1830,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
             groups_per_stream,
             (int) records->ne[0],
             bits,
-            value,
-            live_group_hint);
+            value);
     }
     kvarn_prof_end(prof_mat, stream);
 }

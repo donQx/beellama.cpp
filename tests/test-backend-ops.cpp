@@ -7938,6 +7938,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 0, 2, value));
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 64, 2, value));
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 256, 1, value));
+        test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 16, 504, 1, value));
         test_cases.emplace_back(new test_kvarn_store_only(4, 1, 512, 1, value));
     }
 

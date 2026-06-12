@@ -102,19 +102,6 @@ int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info 
     return (int32_t) n_tokens;
 }
 
-int32_t kvarn_single_stream_live_group_hint(const llama_kv_cache::slot_info & sinfo) {
-    if (sinfo.empty() || sinfo.idxs.size() != 1 || sinfo.idxs[0].empty()) {
-        return -1;
-    }
-
-    uint32_t max_idx = 0;
-    for (const uint32_t idx : sinfo.idxs[0]) {
-        max_idx = std::max(max_idx, idx);
-    }
-
-    return (int32_t) (max_idx / KVAR_N_GROUP);
-}
-
 } // namespace
 
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
@@ -930,8 +917,6 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         stream_count,
         value ? params.value_bits : params.key_bits,
         value);
-    result->op_params[4] = kvarn_single_stream_live_group_hint(sinfo);
-
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(
