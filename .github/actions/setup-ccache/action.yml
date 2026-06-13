@@ -75,7 +75,7 @@ runs:
 
     - name: Restore ccache
       id: restore-cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v5
       with:
         path: ${{ steps.ccache-path.outputs.path }}
         key: ${{ inputs.key }}
