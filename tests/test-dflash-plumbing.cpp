@@ -410,7 +410,7 @@ int main(int argc, char ** argv) {
         "CUDA FlashAttention all-quant dispatch must include D=512 TCQ mixed q8/turbo3 pairs");
     ok &= expect(cuda_fattn.find("hip_native_tcq_decode") != std::string::npos &&
                  cuda_fattn.find("#if defined(GGML_USE_HIP)") != std::string::npos &&
-                 contains_ws(cuda_fattn, "!hip_native_tcq_decode && !turbo_decode_native && turbo_kv"),
+                 contains_ws(cuda_fattn, "!hip_native_tcq_decode && !turbo_decode_native && !prefer_native_vec && turbo_kv"),
         "HIP TCQ decode must stay on the native VEC path instead of dequantizing into generic tile/MMA FlashAttention");
     ok &= expect(cuda_fattn.find("turbo_mma_fused && turbo_mma_supported && Q->ne[1] <= 4") != std::string::npos &&
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO4_0 ||") != std::string::npos &&

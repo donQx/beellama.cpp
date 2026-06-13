@@ -1026,6 +1026,53 @@ static __global__ void k_turbo_fwht_forward(
     }
 }
 
+static inline bool ggml_cuda_fattn_is_classic_non_q8_type(const ggml_type type) {
+    return type == GGML_TYPE_BF16 ||
+           type == GGML_TYPE_Q4_0 ||
+           type == GGML_TYPE_Q4_1 ||
+           type == GGML_TYPE_Q5_0 ||
+           type == GGML_TYPE_Q5_1 ||
+           type == GGML_TYPE_Q6_0 ||
+           type == GGML_TYPE_Q6_1 ||
+           type == GGML_TYPE_Q3_0 ||
+           type == GGML_TYPE_Q3_1 ||
+           type == GGML_TYPE_Q2_0 ||
+           type == GGML_TYPE_Q2_1;
+}
+
+static void ggml_cuda_fattn_materialize_to_f16(
+        const ggml_tensor * src, half * dst, cudaStream_t stream, ggml_tensor & src_f16) {
+    const size_t bs = ggml_blck_size(src->type);
+    const size_t ts = ggml_type_size(src->type);
+
+    src_f16 = *src;
+    src_f16.type = GGML_TYPE_F16;
+    src_f16.data = dst;
+    src_f16.nb[0] = sizeof(half);
+
+    if (ggml_is_contiguously_allocated(src)) {
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src->type);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src->data, dst, ggml_nelements(src), stream);
+
+        src_f16.nb[1] = src->nb[1] * bs * sizeof(half) / ts;
+        src_f16.nb[2] = src->nb[2] * bs * sizeof(half) / ts;
+        src_f16.nb[3] = src->nb[3] * bs * sizeof(half) / ts;
+    } else {
+        GGML_ASSERT(src->nb[0] == ts);
+        const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(src->type);
+        GGML_ASSERT(to_fp16 != nullptr);
+        const int64_t s01 = src->nb[1] / ts;
+        const int64_t s02 = src->nb[2] / ts;
+        const int64_t s03 = src->nb[3] / ts;
+        to_fp16(src->data, dst, src->ne[0], src->ne[1], src->ne[2], src->ne[3], s01, s02, s03, stream);
+
+        src_f16.nb[1] = src->ne[0] * sizeof(half);
+        src_f16.nb[2] = src->ne[1] * src_f16.nb[1];
+        src_f16.nb[3] = src->ne[2] * src_f16.nb[2];
+    }
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
@@ -1034,12 +1081,17 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO4_TCQ || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
     const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_TCQ || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+    const bool classic_non_q8_v = !turbo_v && ggml_cuda_fattn_is_classic_non_q8_type(V->type);
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
+    bool v_f16_layout_set = false;
+
+    ggml_tensor K_f16 = *K;
+    ggml_tensor V_f16 = *V;
 
     // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_k) {
@@ -1115,8 +1167,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
-    // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
-    if (turbo_v) {
+    // Allocate and materialize V to fp16 (turbo2, turbo3, turbo4, or classic non-q8).
+    if (turbo_v || classic_non_q8_v) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * v_root = V;
         while (v_root->view_src) v_root = v_root->view_src;
@@ -1182,15 +1234,14 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
-        } else {
+        } else if (V->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else {
+            ggml_cuda_fattn_materialize_to_f16(V, v_fp16, stream, V_f16);
+            v_f16_layout_set = true;
         }
     }
-
-    // Create fp16 tensor copies on stack
-    ggml_tensor K_f16 = *K;
-    ggml_tensor V_f16 = *V;
 
     if (k_fp16) {
         K_f16.type = GGML_TYPE_F16;
@@ -1201,7 +1252,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         K_f16.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
     }
 
-    if (v_fp16) {
+    if (v_fp16 && !v_f16_layout_set) {
         V_f16.type = GGML_TYPE_F16;
         V_f16.data = v_fp16;
         V_f16.nb[0] = sizeof(half);
@@ -1380,18 +1431,21 @@ static inline bool ggml_cuda_fattn_pair_compiled(const ggml_type type_K_in, cons
 #endif
 }
 
-static inline bool ggml_cuda_fattn_is_classic_non_q8_type(const ggml_type type) {
-    return type == GGML_TYPE_BF16 ||
-           type == GGML_TYPE_Q4_0 ||
-           type == GGML_TYPE_Q4_1 ||
-           type == GGML_TYPE_Q5_0 ||
-           type == GGML_TYPE_Q5_1 ||
-           type == GGML_TYPE_Q6_0 ||
-           type == GGML_TYPE_Q6_1 ||
-           type == GGML_TYPE_Q3_0 ||
-           type == GGML_TYPE_Q3_1 ||
-           type == GGML_TYPE_Q2_0 ||
-           type == GGML_TYPE_Q2_1;
+static inline bool ggml_cuda_fattn_prefers_native_vec_for_turbo_k_classic_v(
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    return ggml_cuda_fattn_is_turbo_kv_type(K->type) &&
+           !ggml_cuda_fattn_is_turbo_kv_type(V->type) &&
+           ggml_cuda_fattn_is_classic_non_q8_type(V->type) &&
+           Q->ne[0] <= 512 &&
+           Q->ne[0] % 64 == 0 &&
+           ggml_cuda_fattn_pair_compiled(K->type, V->type);
+}
+
+static inline bool ggml_cuda_fattn_prefill_mma_can_materialize_turbo_k_classic_v(
+        const ggml_tensor * K, const ggml_tensor * V) {
+    return ggml_cuda_fattn_is_turbo_kv_type(K->type) &&
+           !ggml_cuda_fattn_is_turbo_kv_type(V->type) &&
+           ggml_cuda_fattn_is_classic_non_q8_type(V->type);
 }
 
 // Shape guard for the effective K/V pair after Turbo V decode-dequant.
@@ -2317,6 +2371,8 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
 #endif
 
     const bool turbo_decode_native = getenv("GGML_TURBO_DECODE_NATIVE") != nullptr;
+    const bool prefer_native_vec =
+        ggml_cuda_fattn_prefers_native_vec_for_turbo_k_classic_v(Q, K, V);
 
     const bool turbo_k_only = ggml_cuda_fattn_is_turbo_kv_type(K->type);
     const bool turbo_v_only = ggml_cuda_fattn_is_turbo_kv_type(V->type);
@@ -2327,6 +2383,8 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
         !turbo_k_only;
 
     // Decode-dequant policy:
+    // - Compiled Turbo K + classic non-q8 V fallback routes stay native vec
+    //   instead of taking generic f16 materialization after Turbo K decode.
     // - D <= 256: Turbo K/V sides may be decoded to f16.
     // - D = 512: f16/q8_0/Turbo pairs keep the existing f16 route.
     // - D = 512 classic non-q8 K + Turbo V decodes Turbo V to f16 and keeps
@@ -2340,6 +2398,7 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
     plan.decode_dequant =
         !hip_native_tcq_decode &&
         !turbo_decode_native &&
+        !prefer_native_vec &&
         turbo_kv &&
         (Q->ne[0] <= 256 ||
          (Q->ne[0] <= 512 && k_f16_q8_or_turbo && v_f16_q8_or_turbo) ||
@@ -2425,6 +2484,7 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
             "Kshape=[%lld,%lld,%lld,%lld] Vshape=[%lld,%lld,%lld,%lld] "
             "Keff=%s Veff=%s "
             "turbo_kv=%d "
+            "prefer_native_vec=%d "
             "decode=%d dk=%d dv=%d "
             "unsafe_vec_after_turbo_v_decode=%d allow_vec=%d "
             "kernel=%s "
@@ -2438,6 +2498,7 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
             (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
             ggml_type_name(plan.effective_type_K), ggml_type_name(plan.effective_type_V),
             (int) turbo_kv,
+            (int) prefer_native_vec,
             (int) plan.decode_dequant,
             (int) plan.decode_dequant_K,
             (int) plan.decode_dequant_V,
@@ -2588,12 +2649,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    const bool turbo_k_classic_v_prefill =
+        ggml_cuda_fattn_prefill_mma_can_materialize_turbo_k_classic_v(K, V);
+    const bool turbo_prefill_can_make_f16_K = ggml_cuda_turbo_prefill_mma_can_make_f16(K->type);
+    const bool turbo_prefill_can_make_f16_V = ggml_cuda_turbo_prefill_mma_can_make_f16(V->type);
     const bool turbo_prefill_mma_safe =
         turbo_kv &&
-        ggml_cuda_turbo_prefill_mma_can_make_f16(K->type) &&
-        ggml_cuda_turbo_prefill_mma_can_make_f16(V->type);
+        ((turbo_prefill_can_make_f16_K &&
+          turbo_prefill_can_make_f16_V) ||
+         turbo_k_classic_v_prefill);
+    const bool turbo_prefill_turing_mma =
+        turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 
-    if (turbo_prefill_mma_safe && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 256 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    if (turbo_prefill_mma_safe && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 512 && turbo_prefill_turing_mma) {
         if (turbo_fa_debug) {
             fprintf(stderr,
                 "GGML_TURBO_FA_DEBUG: path=prefill-dequant K=%s V=%s Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld]\n",
@@ -2608,11 +2676,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     } else {
         if (turbo_fa_debug && turbo_kv) {
             fprintf(stderr,
-                "GGML_TURBO_FA_DEBUG: path=decode-dequant-or-vec K=%s V=%s Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld]\n",
+                "GGML_TURBO_FA_DEBUG: path=decode-dequant-or-vec K=%s V=%s Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld] prefill_safe=%d can_make_f16_K=%d can_make_f16_V=%d turbo_k_classic_v_prefill=%d vec_override=%d batch_ok=%d dim_ok=%d turing_mma=%d\n",
                 ggml_type_name(K->type), ggml_type_name(V->type),
                 (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
                 (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
-                (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3]);
+                (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
+                (int) turbo_prefill_mma_safe,
+                (int) turbo_prefill_can_make_f16_K,
+                (int) turbo_prefill_can_make_f16_V,
+                (int) turbo_k_classic_v_prefill,
+                (int) turbo_prefill_vec,
+                (int) (Q->ne[1] > 1),
+                (int) (Q->ne[0] <= 512),
+                (int) turbo_prefill_turing_mma);
         }
         load_tcq_decode_alpha(ctx.device);
 
