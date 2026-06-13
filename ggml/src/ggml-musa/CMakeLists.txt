@@ -106,33 +106,73 @@ if (MUSAToolkit_FOUND)
     else()
         set(GGML_CUDA_FA_DEFAULT_KV_PAIRS
             f16:f16
-            q4_0:q4_0
-            q8_0:q8_0
+            f16:q8_0
+            f16:q6_1
+            f16:q6_0
+            f16:q5_1
+            f16:q5_0
             bf16:bf16
-            turbo2_0:turbo2_0
-            turbo3_0:turbo3_0
-            turbo4_0:turbo4_0
-            turbo3_tcq:turbo3_tcq
-            turbo2_tcq:turbo2_tcq
-            turbo2_0:q8_0
-            turbo3_0:q8_0
-            turbo4_0:q8_0
-            q8_0:turbo2_0
-            q8_0:turbo3_0
-            q8_0:turbo4_0
-            turbo4_0:turbo3_0
-            turbo3_0:turbo4_0
-            turbo2_0:turbo3_0
-            turbo3_0:turbo2_0
-            turbo3_tcq:q8_0
-            turbo2_tcq:q8_0
-            q8_0:turbo3_tcq
-            q8_0:turbo2_tcq
-            turbo3_tcq:turbo2_tcq
-            turbo2_tcq:turbo3_tcq
-            turbo4_0:turbo3_tcq
-            turbo3_0:turbo3_tcq
+            bf16:q8_0
+            bf16:q6_1
+            bf16:q6_0
+            bf16:q5_1
+            bf16:q5_0
+            q8_0:q8_0
+            q8_0:q6_1
+            q8_0:q6_0
+            q8_0:q5_1
+            q8_0:q5_0
+            q8_0:q4_1
+            q8_0:q4_0
+            q6_1:q6_1
+            q6_1:q6_0
+            q6_1:q5_1
+            q6_1:q5_0
+            q6_1:q4_1
+            q6_1:q4_0
+            q6_0:q6_0
+            q6_0:q5_1
+            q6_0:q5_0
+            q6_0:q4_1
+            q6_0:q4_0
+            q5_1:q5_1
+            q5_1:q5_0
+            q5_1:q4_1
+            q5_1:q4_0
+            q5_1:q3_1
+            q5_1:q3_0
+            q5_0:q5_0
+            q5_0:q4_1
+            q5_0:q4_0
+            q5_0:q3_1
+            q5_0:q3_0
+            q4_1:q4_1
+            q4_1:q4_0
+            q4_1:q3_1
+            q4_1:q3_0
+            q4_1:q2_1
+            q4_1:q2_0
+            q4_0:q4_0
+            q4_0:q3_1
+            q4_0:q3_0
+            q4_0:q2_1
+            q4_0:q2_0
+            q3_1:q3_1
+            q3_1:q3_0
+            q3_1:q2_1
+            q3_1:q2_0
+            q3_0:q3_0
+            q3_0:q2_1
+            q3_0:q2_0
+            q2_1:q2_1
+            q2_1:q2_0
+            q2_0:q2_0
         )
+
+        list(LENGTH GGML_CUDA_FA_DEFAULT_KV_PAIRS GGML_CUDA_FA_DEFAULT_PAIR_COUNT)
+        if (NOT GGML_CUDA_FA_DEFAULT_PAIR_COUNT EQUAL 62)
+            message(FATAL_ERROR "Default MUSA FA vec policy expected 62 pairs, got ${GGML_CUDA_FA_DEFAULT_PAIR_COUNT}")
+        endif()
 
         foreach(PAIR ${GGML_CUDA_FA_DEFAULT_KV_PAIRS})
             string(REPLACE ":" ";" PARTS "${PAIR}")

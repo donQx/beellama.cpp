@@ -71,7 +71,7 @@ cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
 cmake --build build -j
 ```
 
-`GGML_CUDA_FA_HALF_QUANTS=ON` is the recommended CUDA FlashAttention build mode for these DFlash/TurboQuant quickstarts. It compiles the useful asymmetric K/V cache type half-matrix plus f16 fallback pairs needed by TurboQuant/TCQ dequant paths. Use `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 169-pair K/V matrix or arbitrary asymmetric cache-type combinations. These flags are mutually exclusive.
+`GGML_CUDA_FA_HALF_QUANTS=ON` is the recommended CUDA FlashAttention build mode for DFlash/TurboQuant quickstarts because it compiles the Turbo/TCQ-capable 208-pair half-matrix plus f16 fallback pairs needed by TurboQuant/TCQ dequant paths. If you are staying on standard q cache types or KVarN fallback types, the no-flag default compiles the smaller 62-pair q/KVarN-fallback set. Use `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 361-pair K/V matrix or arbitrary asymmetric cache-type combinations. These flags are mutually exclusive.
 
 **macOS (Metal).**
 

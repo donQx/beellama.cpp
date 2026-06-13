@@ -582,6 +582,59 @@ int main(int argc, char ** argv) {
                  cuda_dispatch_generator.find("assert all_count == 361") != std::string::npos &&
                  cuda_dispatch_generator.find("assert half_count == 208") != std::string::npos,
         "CUDA FlashAttention generators and CMake must include turbo4_tcq and the new q KV types in ALL/HALF matrices");
+    {
+        const std::string cuda_cmake_default_pairs = slice_between(
+            cuda_cmake,
+            "set(GGML_CUDA_FA_DEFAULT_KV_PAIRS",
+            "foreach(PAIR ${GGML_CUDA_FA_DEFAULT_KV_PAIRS})");
+        const std::string cuda_fattn_default_dispatch = slice_between(
+            cuda_fattn,
+            "#else\n    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_F16, GGML_TYPE_F16)",
+            "#endif\n\n    fprintf(stderr,");
+        const std::string generator_default_pairs = slice_between(
+            cuda_dispatch_generator,
+            "DEFAULT_PAIRS = [",
+            "]\n\ndef emit_pair");
+        const auto cmake_has_default_pair = [&](const char * pair) {
+            return cuda_cmake_default_pairs.find(std::string("\n            ") + pair + "\n") != std::string::npos;
+        };
+
+        ok &= expect(cuda_cmake.find("GGML_CUDA_FA_DEFAULT_PAIR_COUNT EQUAL 62") != std::string::npos &&
+                     cuda_dispatch_generator.find("assert len(DEFAULT_PAIRS) == 62") != std::string::npos,
+            "CUDA FlashAttention default build must compile the fork q/KVarN fallback 62-pair policy");
+        ok &= expect(cuda_fattn.find("ggml_cuda_fattn_default_kv_tier") != std::string::npos &&
+                     cuda_fattn.find("tier_V - tier_K <= 2") != std::string::npos,
+            "CUDA FlashAttention runtime support checks must derive default pairs from the same bit-tier policy");
+        ok &= expect(cuda_fattn.find("standard q/KVarN fallback cache types") != std::string::npos &&
+                     cuda_fattn.find("GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS") != std::string::npos,
+            "CUDA FlashAttention missing-pair diagnostics must suggest q/KVarN or larger FA build modes");
+        ok &= expect(cmake_has_default_pair("f16:f16") &&
+                     cmake_has_default_pair("bf16:bf16") &&
+                     cmake_has_default_pair("q8_0:q4_0") &&
+                     cmake_has_default_pair("q6_0:q4_0") &&
+                     cmake_has_default_pair("q5_0:q3_0") &&
+                     cmake_has_default_pair("q4_0:q2_0"),
+            "CUDA FlashAttention default CMake pairs must include q/KVarN fallback tiers through q2");
+        ok &= expect(generator_default_pairs.find("GGML_TYPE_Q8_0\", \"GGML_TYPE_Q4_0") != std::string::npos &&
+                     generator_default_pairs.find("GGML_TYPE_Q5_0\", \"GGML_TYPE_Q3_0") != std::string::npos &&
+                     generator_default_pairs.find("GGML_TYPE_Q4_0\", \"GGML_TYPE_Q2_0") != std::string::npos,
+            "CUDA FlashAttention default dispatch generator must include the q/KVarN fallback pair tiers");
+        ok &= expect(cuda_fattn_default_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)") != std::string::npos &&
+                     cuda_fattn_default_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q5_0, GGML_TYPE_Q3_0)") != std::string::npos &&
+                     cuda_fattn_default_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_0, GGML_TYPE_Q2_0)") != std::string::npos,
+            "CUDA FlashAttention default dispatch must include q/KVarN fallback pair tiers");
+        ok &= expect(cuda_cmake_default_pairs.find("turbo") == std::string::npos &&
+                     generator_default_pairs.find("GGML_TYPE_TURBO") == std::string::npos &&
+                     cuda_fattn_default_dispatch.find("GGML_TYPE_TURBO") == std::string::npos,
+            "CUDA FlashAttention default build must leave Turbo/TurboTCQ pairs to HALF or ALL builds");
+        ok &= expect(!cmake_has_default_pair("f16:bf16") &&
+                     !cmake_has_default_pair("bf16:f16") &&
+                     !cmake_has_default_pair("f16:q4_0") &&
+                     !cmake_has_default_pair("bf16:q4_0") &&
+                     !cmake_has_default_pair("q8_0:q3_0") &&
+                     !cmake_has_default_pair("q6_0:q3_0"),
+            "CUDA FlashAttention default build must cap fp at q5 and q8/q6 at q4 without f16/bf16 asymmetry");
+    }
     ok &= expect(arch_cpp.find("{ LLM_ARCH_DFLASH,") != std::string::npos,
         "upstream dflash architecture must be registered separately");
     ok &= expect(convert_py.find("from conversion import") != std::string::npos,
