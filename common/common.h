@@ -432,6 +432,14 @@ struct common_params_speculative {
         return std::find(types.begin(), types.end(), t) != types.end();
     }
 
+    bool dflash_selected() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+    }
+
+    bool dflash_selected_or_pending() const {
+        return dflash_selected() || (type() == COMMON_SPECULATIVE_TYPE_NONE && has_dft());
+    }
+
     // fork: single-type compat helper (most fork code checks one type at a time)
     common_speculative_type type() const {
         if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {

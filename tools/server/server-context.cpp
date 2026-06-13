@@ -56,7 +56,7 @@ server_dflash_recurrent_rollback_plan server_context_dflash_recurrent_rollback_p
         bool target_recurrent_or_hybrid) {
     server_dflash_recurrent_rollback_plan plan;
 
-    if (speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || !target_recurrent_or_hybrid) {
+    if (!speculative.dflash_selected_or_pending() || !target_recurrent_or_hybrid) {
         return plan;
     }
 
@@ -287,7 +287,7 @@ static ggml_backend_dev_t server_single_gpu_device_from_list(const std::vector<g
 
 static bool server_dflash_single_explicit_draft_device(const common_params & params, ggml_backend_dev_t & dev) {
     dev = nullptr;
-    if (params.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || !params.speculative.has_dft()) {
+    if (!params.speculative.dflash_selected() || !params.speculative.has_dft()) {
         return false;
     }
 
@@ -2124,7 +2124,7 @@ private:
     server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const {
         server_dflash_recurrent_rollback_plan plan;
 
-        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (!params_base.speculative.dflash_selected_or_pending()) {
             return plan;
         }
 
@@ -2559,7 +2559,7 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
-        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+        if (params_base.speculative.dflash_selected_or_pending() &&
                 needs_reeval &&
                 !recurrent_backup_sequences &&
                 llama_n_rs_seq(ctx_tgt) == 0) {
@@ -2600,7 +2600,7 @@ private:
             params_dft.cache_type_v = params_spec.cache_type_v;
             params_dft.kvarn        = llama_kvarn_default_params();
 
-            const bool draft_type_is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+            const bool draft_type_is_dflash = params_base.speculative.dflash_selected();
             ggml_backend_dev_t explicit_single_draft_dev = server_single_gpu_device_from_list(params_spec.devices);
             const bool dflash_explicit_single_draft_device = draft_type_is_dflash && explicit_single_draft_dev != nullptr;
             if (dflash_explicit_single_draft_device) {

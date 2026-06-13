@@ -1076,8 +1076,8 @@ static void common_params_kvarn_normalize(common_params & params) {
 
 static void common_params_speculative_normalize(common_params & params) {
     auto & s = params.speculative;
-    const bool has_dflash = std::find(s.types.begin(), s.types.end(), COMMON_SPECULATIVE_TYPE_DFLASH) != s.types.end();
-    const bool may_auto_detect_dflash = !has_dflash && s.type() == COMMON_SPECULATIVE_TYPE_NONE && s.has_dft();
+    const bool has_dflash = s.dflash_selected();
+    const bool may_auto_detect_dflash = !has_dflash && s.dflash_selected_or_pending();
 
     if (has_dflash) {
         s.apply_dflash_effective_defaults();

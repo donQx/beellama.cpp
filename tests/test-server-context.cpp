@@ -44,6 +44,26 @@ int main() {
     assert(plan.needs_backup_sequences);
     assert(!plan.needs_attention_backup_streams);
 
+    params.speculative.types = {
+        COMMON_SPECULATIVE_TYPE_DFLASH,
+        COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+    };
+    params.speculative.branch_budget = 0;
+    plan = server_context_dflash_recurrent_rollback_plan(
+            params.speculative,
+            /*target_recurrent_or_hybrid =*/ true);
+    assert(plan.needs_backup_sequences);
+    assert(!plan.needs_attention_backup_streams);
+
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+    params.speculative.draft.mparams.path = "draft.gguf";
+    params.speculative.branch_budget = 0;
+    plan = server_context_dflash_recurrent_rollback_plan(
+            params.speculative,
+            /*target_recurrent_or_hybrid =*/ true);
+    assert(plan.needs_backup_sequences);
+    assert(!plan.needs_attention_backup_streams);
+
     params.speculative.branch_budget = 4;
     plan = server_context_dflash_recurrent_rollback_plan(
             params.speculative,

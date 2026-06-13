@@ -1565,7 +1565,7 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
     ok &= expect(server_context.find("server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const") != std::string::npos &&
-                 server_context.find("params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
+                 server_context.find("params_base.speculative.dflash_selected_or_pending()") != std::string::npos &&
                  server_context.find("flat DFlash target architecture %s will use recurrent-only backup cells; keeping attention streams at n_parallel=%d") != std::string::npos &&
                  server_context.find("llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1)") != std::string::npos,
         "server must use recurrent-only backup cells for flat DFlash instead of RS snapshots or attention backup streams");
@@ -2500,7 +2500,7 @@ int main(int argc, char ** argv) {
         "server auto n_parallel must allow unified KV for KVarN");
     ok &= expect(server_context.find("server_probe_model_arch") != std::string::npos &&
                  server_context.find("gguf_find_key(ctx_gguf, \"general.architecture\")") != std::string::npos &&
-                 server_context.find("params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
+                 server_context.find("params_base.speculative.dflash_selected_or_pending()") != std::string::npos &&
                  server_context.find("server_arch_name_is_recurrent_or_hybrid") != std::string::npos &&
                  server_context.find("\"qwen35\"") != std::string::npos &&
                  server_context.find("\"gemma4\"") == std::string::npos &&
