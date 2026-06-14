@@ -57,6 +57,15 @@ int main(int argc, char ** argv) {
     const std::string prefill_policy = slice_between(fattn,
             "static inline bool ggml_cuda_fattn_prefill_mma_can_materialize_turbo_k_classic_v",
             "// Shape guard for the effective K/V pair after Turbo V decode-dequant.");
+    const std::string classic_non_q8 = slice_between(fattn,
+            "static inline bool ggml_cuda_fattn_is_classic_non_q8_type",
+            "static void ggml_cuda_fattn_materialize_to_f16");
+    const std::string unsafe_k_helper = slice_between(fattn,
+            "static inline bool ggml_cuda_fattn_is_turbo_v_decode_unsafe_k_type",
+            "static inline bool ggml_cuda_fattn_effective_vec_shape_unsafe");
+    const std::string unsafe_shape = slice_between(fattn,
+            "static inline bool ggml_cuda_fattn_effective_vec_shape_unsafe",
+            "static void ggml_cuda_flash_attn_ext_vec");
     const std::string exec = slice_between(fattn,
             "void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst)",
             "bool ggml_cuda_flash_attn_ext_support");
@@ -92,6 +101,18 @@ int main(int argc, char ** argv) {
                  prefill_policy.find("!ggml_cuda_fattn_is_turbo_kv_type(V->type)") != std::string::npos &&
                  prefill_policy.find("ggml_cuda_fattn_is_classic_non_q8_type(V->type)") != std::string::npos,
         "Turbo K + classic V prefill eligibility must not broaden classic-K/Turbo-V routing");
+
+    ok &= expect(!classic_non_q8.empty() &&
+                 classic_non_q8.find("GGML_TYPE_Q8_0") == std::string::npos,
+        "classic non-q8 helper must not be broadened to include q8_0");
+    ok &= expect(!unsafe_k_helper.empty() &&
+                 unsafe_k_helper.find("GGML_TYPE_Q8_0") != std::string::npos &&
+                 unsafe_k_helper.find("ggml_cuda_fattn_is_classic_non_q8_type(type)") != std::string::npos,
+        "Turbo V decode unsafe-K policy must cover q8_0 plus classic non-q8 K types");
+    ok &= expect(!unsafe_shape.empty() &&
+                 unsafe_shape.find("ggml_cuda_fattn_is_turbo_v_decode_unsafe_k_type(K->type)") != std::string::npos &&
+                 unsafe_shape.find("V->type == GGML_TYPE_F16") != std::string::npos,
+        "Turbo V decode shape guard must use the unsafe-K policy for effective f16 V");
 
     return ok ? 0 : 1;
 }

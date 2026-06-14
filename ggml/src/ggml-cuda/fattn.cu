@@ -1471,14 +1471,19 @@ static inline bool ggml_cuda_fattn_prefill_mma_can_materialize_turbo_k_classic_v
            ggml_cuda_fattn_is_classic_non_q8_type(V->type);
 }
 
+static inline bool ggml_cuda_fattn_is_turbo_v_decode_unsafe_k_type(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0 ||
+           ggml_cuda_fattn_is_classic_non_q8_type(type);
+}
+
 // Shape guard for the effective K/V pair after Turbo V decode-dequant.
-// Gemma-like D>=256 with classic_K/f16 (non-q8) is unsafe on the vec path.
+// D>=256 with classic-or-q8 K/f16 V is unsafe on the vec path.
 // Only applied when V was actually decoded from Turbo — explicit q5_0/f16
 // at D>=256 is unaffected. D=128 is safe on vec and not gated.
 static inline bool ggml_cuda_fattn_effective_vec_shape_unsafe(
         const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
     return Q->ne[0] >= 256 &&
-           ggml_cuda_fattn_is_classic_non_q8_type(K->type) &&
+           ggml_cuda_fattn_is_turbo_v_decode_unsafe_k_type(K->type) &&
            V->type == GGML_TYPE_F16;
 }
 
@@ -2502,8 +2507,8 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
     }
 
     // If V was decoded from Turbo to f16 and the effective pair is
-    // classic_K/f16 at D>=256, the vec path is unsafe. Only gate vec for
-    // Turbo-originated f16 V — explicit q5_0/f16 at D>=256 is unaffected.
+    // classic-or-q8 K/f16 at D>=256, the vec path is unsafe. Only gate vec
+    // for Turbo-originated f16 V — explicit q5_0/f16 at D>=256 is unaffected.
     // Disable vec so the existing kernel selector picks MMA_F16 or tile with
     // generic f16 K conversion. D=128 is fine on vec and is not affected.
     plan.unsafe_vec_after_turbo_v_decode =
