@@ -1146,21 +1146,55 @@ struct server_slot : server_adaptive_dm_state {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max(
+    int apply_n_draft_slot_limits(
             const common_params & global_params,
-            bool advance_adaptive_probe = false,
-            int dflash_cohort_n_max = -1) {
+            int n_draft_min,
+            int n_draft_max) {
+        // determine the max draft that fits the current slot state
+        // note: slot.prompt is not yet expanded with the `id` token sampled above
+        //       also, need to leave space for 1 extra token to allow context shifts
+        n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
+
+        const int32_t remaining = remaining_generation_budget(global_params);
+        if (remaining > 0) {
+            n_draft_max = std::min(n_draft_max, remaining - 1);
+        }
+
+        SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+
+        if (n_draft_max < n_draft_min) {
+            SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, n_draft_min);
+            n_draft_max = 0;
+        }
+
+        return n_draft_max;
+    }
+
+    int get_n_draft_max(const common_params & global_params) {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
             return 0;
         }
 
-        if (global_params.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            if (common_sampler_reasoning_is_forcing(smpl.get())) {
-                return 0;
-            }
-        } else if (common_sampler_blocks_speculative(smpl.get())) {
+        return apply_n_draft_slot_limits(
+                global_params,
+                common_speculative_n_min(get_spec(), task->params.speculative),
+                common_speculative_n_max(get_spec(), task->params.speculative));
+    }
+
+    int get_dflash_n_draft_max(
+            const common_params & global_params,
+            bool advance_adaptive_probe = false,
+            int dflash_cohort_n_max = -1) {
+        GGML_ASSERT(task);
+        GGML_ASSERT(global_params.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH);
+
+        if (!can_speculate()) {
+            return 0;
+        }
+
+        if (common_sampler_reasoning_is_forcing(smpl.get())) {
             return 0;
         }
 
@@ -1274,24 +1308,7 @@ struct server_slot : server_adaptive_dm_state {
             n_draft_max = std::min(n_draft_max, dflash_cohort_n_max);
         }
 
-        // determine the max draft that fits the current slot state
-        // note: slot.prompt is not yet expanded with the `id` token sampled above
-        //       also, need to leave space for 1 extra token to allow context shifts
-        n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
-
-        const int32_t remaining = remaining_generation_budget(global_params);
-        if (remaining > 0) {
-            n_draft_max = std::min(n_draft_max, remaining - 1);
-        }
-
-        SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
-
-        if (n_draft_max < n_draft_min) {
-            SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, n_draft_min);
-            n_draft_max = 0;
-        }
-
-        return n_draft_max;
+        return apply_n_draft_slot_limits(global_params, n_draft_min, n_draft_max);
     }
 
     int32_t effective_n_predict(const common_params & global_params) const {
@@ -3658,12 +3675,21 @@ private:
 
                 if (server_tail_has_tool_call_marker(slot.generated_text, marker_scan_pos)) {
                     slot.reasoning_tool_marker_logged = true;
-                    SLT_WRN(slot,
-                            "raw tool marker observed while lazy grammar is enabled; keeping DFlash governed by active grammar boundary in_reasoning=%d n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
-                            in_reasoning ? 1 : 0,
-                            slot.n_decoded,
-                            slot.reasoning_output_tokens,
-                            slot.visible_output_tokens);
+                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        SLT_WRN(slot,
+                                "raw tool marker observed while lazy grammar is enabled; DFlash tree and reduced verification remain behind the active grammar boundary in_reasoning=%d n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
+                                in_reasoning ? 1 : 0,
+                                slot.n_decoded,
+                                slot.reasoning_output_tokens,
+                                slot.visible_output_tokens);
+                    } else {
+                        SLT_WRN(slot,
+                                "raw tool marker observed while lazy grammar is enabled; active grammar will be handled by the sampler in_reasoning=%d n_decoded=%d reasoning_tokens=%d visible_tokens=%d\n",
+                                in_reasoning ? 1 : 0,
+                                slot.n_decoded,
+                                slot.reasoning_output_tokens,
+                                slot.visible_output_tokens);
+                    }
                 }
             }
 
@@ -4808,10 +4834,10 @@ private:
                     continue;
                 }
 
-                normal_n_max[slot.id] = slot.get_n_draft_max(params_base, false);
+                normal_n_max[slot.id] = slot.get_dflash_n_draft_max(params_base, false);
                 cohort_cap_n_max[slot.id] = normal_n_max[slot.id] > 0
                     ? normal_n_max[slot.id]
-                    : slot.get_n_draft_max(params_base, false, INT_MAX);
+                    : slot.get_dflash_n_draft_max(params_base, false, INT_MAX);
             }
 
             const int cohort_n_max = server_adaptive_dm_resolve_cohort_n_max(
@@ -4829,12 +4855,12 @@ private:
         auto dflash_scheduler_n_draft_max = [&](server_slot & slot, bool advance_adaptive_probe) {
             if (slot.id >= 0 && slot.id < (int) dflash_cohort_n_draft_max.size() &&
                     dflash_cohort_n_draft_max[slot.id] > 0) {
-                return slot.get_n_draft_max(
+                return slot.get_dflash_n_draft_max(
                         params_base, advance_adaptive_probe, dflash_cohort_n_draft_max[slot.id]);
             }
-            return slot.get_n_draft_max(params_base, advance_adaptive_probe);
+            return slot.get_dflash_n_draft_max(params_base, advance_adaptive_probe);
         };
-        if (ctx_dft_shared) {
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && ctx_dft_shared) {
             int n_drafting = 0;
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
@@ -4929,7 +4955,9 @@ private:
                 continue;
             }
 
-            int n_draft_max = dflash_scheduler_n_draft_max(slot, true);
+            int n_draft_max = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
+                ? dflash_scheduler_n_draft_max(slot, true)
+                : slot.get_n_draft_max(params_base);
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     params_base.speculative.branch_budget == 0) {
                 n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max);
@@ -6937,17 +6965,6 @@ private:
 
                     // update how many tokens out of those tested were accepted
                     slot.n_draft_accepted += ids.size() - 1;
-
-                    if (slot.dm_adaptive) {
-                        slot.observe_profit_acceptance((int) n_draft, (int) ids.size() - 1);
-                        slot.profit_pending = true;
-                        if (slot.profit_pending_requested_n_max <= 0) {
-                            slot.profit_pending_requested_n_max = (int32_t) n_draft;
-                        }
-                        slot.profit_pending_n_draft = (int32_t) n_draft;
-                        slot.profit_pending_n_accepted = (int32_t) ids.size() - 1;
-                        slot.profit_pending_tree = false;
-                    }
 
                     // add accepted tokens to the prompt
                     slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);

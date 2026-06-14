@@ -1578,6 +1578,20 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("const bool slot_uses_fork_spec") != std::string::npos &&
                  server_context.find("server_speculative_uses_fork_slot_impls(params_base.speculative)") != std::string::npos,
         "server must keep fork-only per-slot speculative state separate from upstream MTP shared speculative state");
+    {
+        const std::string generic_horizon = slice_between(
+                server_context,
+                "int get_n_draft_max(",
+                "int get_dflash_n_draft_max(");
+        ok &= expect(!generic_horizon.empty() &&
+                     generic_horizon.find("COMMON_SPECULATIVE_TYPE_DFLASH") == std::string::npos &&
+                     generic_horizon.find("common_sampler_blocks_speculative") == std::string::npos &&
+                     generic_horizon.find("dm_adaptive") == std::string::npos,
+            "upstream MTP draft horizon must not inherit DFlash grammar or adaptive-depth policy");
+    }
+    ok &= expect(server_context.find("int get_dflash_n_draft_max(") != std::string::npos &&
+                 server_context.find("common_sampler_reasoning_is_forcing") > server_context.find("int get_dflash_n_draft_max("),
+        "DFlash draft-depth policy must live in an explicit DFlash helper");
     ok &= expect(server_context.find("common_context_can_seq_rm(ctx_dft.get())") != std::string::npos,
         "MTP draft context must probe seq_rm capability with common_context_can_seq_rm, not guess from n_rs_seq");
     ok &= expect(server_context.find("failed to create MTP draft-model context") != std::string::npos,
@@ -1614,6 +1628,18 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("n_rollback > 0") != std::string::npos &&
                  server_context.find("slot.smpl_save") == std::string::npos,
         "server must keep sampler rollback local to the upstream MTP accept path, not as stale slot state");
+    {
+        const std::string mtp_accept = slice_between(
+                server_context,
+                "if (use_mtp_spec_accept) {",
+                "llama_tokens ids;");
+        ok &= expect(!mtp_accept.empty() &&
+                     mtp_accept.find("dm_adaptive") == std::string::npos &&
+                     mtp_accept.find("profit_pending") == std::string::npos,
+            "upstream MTP accept path must stay free of DFlash adaptive-depth telemetry");
+    }
+    ok &= expect(server_context.find("raw tool marker observed while lazy grammar is enabled; keeping DFlash") == std::string::npos,
+        "non-DFlash lazy grammar/tool marker path must not emit DFlash-specific policy text");
     ok &= expect(llama_h.find("llama_context_recurrent_expand") != std::string::npos, "public API must expose context-level recurrent expansion with graph invalidation");
     ok &= expect(server_context.find("llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)") != std::string::npos, "server recurrent shrink must invalidate the context scheduler graph cache");
     ok &= expect(server_context.find("llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)") != std::string::npos, "server recurrent expansion must invalidate the context scheduler graph cache");
