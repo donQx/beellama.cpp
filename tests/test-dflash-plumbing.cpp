@@ -2646,9 +2646,8 @@ int main(int argc, char ** argv) {
                  kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, false)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("KVarN requires full-size SWA cache for now") == std::string::npos,
         "ISWA with KVarN must keep SWA layers on compact normal KV instead of expanding SWA to full-size KVarN");
-    ok &= expect(context_cpp.find("params.kvarn.type != LLAMA_KVARN_K4V2_G128") != std::string::npos &&
-                 context_cpp.find("is experimental; only kvarn_k4v2_g128 is reference-aligned") != std::string::npos,
-        "non-k4v2 KVarN presets must be labeled experimental at runtime");
+    ok &= expect(context_cpp.find("is experimental; only kvarn_k4v2_g128 is reference-aligned") == std::string::npos,
+        "KVarN presets must not emit experimental/reference-aligned startup warnings");
     ok &= expect(llama_bench.find("bench_cache_type_from_name") != std::string::npos &&
                  llama_bench.find("kvarn_bits_from_cache_type") != std::string::npos &&
                  llama_bench.find("normalize_kvarn_cache_pair") != std::string::npos &&
