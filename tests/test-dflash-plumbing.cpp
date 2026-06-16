@@ -2730,9 +2730,17 @@ int main(int argc, char ** argv) {
                  graph_cpp.find("get_k_rotated") != std::string::npos &&
                  graph_cpp.find("get_v_rotated") != std::string::npos &&
                  graph_cpp.find("self_kvarn_rot") != std::string::npos &&
+                 graph_cpp.find("GGML_ASSERT(inp->self_k_rot == nullptr)") != std::string::npos &&
+                 graph_cpp.find("GGML_ASSERT(inp->self_v_rot == nullptr)") != std::string::npos &&
+                 graph_cpp.find("GGML_ASSERT(k_rot == nullptr)") != std::string::npos &&
+                 graph_cpp.find("GGML_ASSERT(v_rot == nullptr)") != std::string::npos &&
+                 count_occurrences(graph_cpp, "GGML_ASSERT(q->type == GGML_TYPE_F32);") >= 2 &&
+                 count_occurrences(graph_cpp, "GGML_ASSERT(cur->type == GGML_TYPE_F32);") >= 2 &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot)") != std::string::npos &&
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
                  kv_cache_kvarn_h.find("build_input_kvarn_rot") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("static const std::vector<float> data = []") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const auto & data = kvarn_hadamard_128()") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
                  cuda_fattn_kvarn.find("ggml_get_op_params_i32(k_mat, 5) != 0") != std::string::npos &&
                  vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0") != std::string::npos &&

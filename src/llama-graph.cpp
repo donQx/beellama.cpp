@@ -2368,6 +2368,17 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    const auto * mctx_cur = inp->mctx;
+    const auto * kvarn_ctx =
+        (kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
+    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+
+    if (use_kvarn_rotated) {
+        GGML_ASSERT(inp->self_k_rot == nullptr);
+        GGML_ASSERT(inp->self_v_rot == nullptr);
+    }
+
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
         k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
@@ -2383,12 +2394,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
-
-    const auto * mctx_cur = inp->mctx;
-    const auto * kvarn_ctx =
-        (kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
-            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
-    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
     // store to KV cache
     {
@@ -2406,6 +2411,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
     if (use_kvarn_rotated) {
+        GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
 
@@ -2425,6 +2431,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
     if (use_kvarn_rotated) {
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_cont(ctx0, cur);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
@@ -2651,6 +2658,18 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const auto * kvarn_ctx =
+        (!is_swa && kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
+    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
+
+    if (use_kvarn_rotated) {
+        GGML_ASSERT(k_rot == nullptr);
+        GGML_ASSERT(v_rot == nullptr);
+    }
+
     if (k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -2675,14 +2694,6 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    const auto * mctx_iswa = inp->mctx;
-
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-    const auto * kvarn_ctx =
-        (!is_swa && kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
-            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
-    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
-
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
@@ -2703,6 +2714,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
     if (use_kvarn_rotated) {
+        GGML_ASSERT(q->type == GGML_TYPE_F32);
         q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
     }
 
@@ -2711,6 +2723,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
     if (use_kvarn_rotated) {
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
         cur = ggml_cont(ctx0, cur);
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
     } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {

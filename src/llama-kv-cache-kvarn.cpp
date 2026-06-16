@@ -123,6 +123,16 @@ void kvarn_gen_hadamard_128(std::vector<float> & data) {
     }
 }
 
+const std::vector<float> & kvarn_hadamard_128() {
+    static const std::vector<float> data = [] {
+        std::vector<float> result;
+        kvarn_gen_hadamard_128(result);
+        return result;
+    }();
+
+    return data;
+}
+
 } // namespace
 
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
@@ -317,8 +327,7 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == KVAR_N_GROUP && dst->ne[1] == KVAR_N_GROUP);
 
-    std::vector<float> data;
-    kvarn_gen_hadamard_128(data);
+    const auto & data = kvarn_hadamard_128();
     memcpy(dst->data, data.data(), ggml_nbytes(dst));
 }
 
