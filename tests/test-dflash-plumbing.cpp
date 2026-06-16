@@ -2734,8 +2734,14 @@ int main(int argc, char ** argv) {
                  graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
                  kv_cache_kvarn_h.find("build_input_kvarn_rot") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
-                 cuda_fattn_kvarn.find("ggml_get_op_params_i32(k_mat, 5) != 0") != std::string::npos,
-        "KVarN rotated-domain FA must be graph-gated, use rotated materialize accessors, rotate Q/output exactly once, and be rejected by native KVarN FA");
+                 cuda_fattn_kvarn.find("ggml_get_op_params_i32(k_mat, 5) != 0") != std::string::npos &&
+                 vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0") != std::string::npos &&
+                 vulkan_cpp.find("emit_rotated ? 1u : 0u") != std::string::npos &&
+                 vulkan_cpp.find("1.0f / std::sqrt((float)src->ne[0])") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("uint emit_rotated") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("if (p.emit_rotated != 0u)") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("barrier();") != std::string::npos,
+        "KVarN rotated-domain FA must be graph-gated, use rotated materialize accessors, rotate Q/output exactly once, preserve Vulkan FWHT/rotated materialize plumbing, and be rejected by native KVarN FA");
 
     return ok ? 0 : 1;
 }

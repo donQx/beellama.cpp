@@ -12,6 +12,7 @@ layout(push_constant) uniform parameter {
     uint bits;
     uint value;
     uint n_indices;
+    uint emit_rotated;
 } p;
 
 layout(binding = 0, std430) readonly buffer Records { uint data_records[]; };
@@ -132,6 +133,16 @@ void main() {
     }
 
     sh_wht[lane] = x;
-    wht_128(lane);
+    if (p.emit_rotated != 0u) {
+        // Rotated-domain attention: emit the dequantized K_rot/V_rot directly,
+        // skipping the per-token inverse-WHT butterfly. The query is rotated and
+        // the attention output inverse-rotated in the graph instead. The barrier
+        // replaces the one wht_128() would have provided before the cross-lane
+        // read in store_dst_pair(). p.emit_rotated is a push constant, so this
+        // branch is uniform across the workgroup (barrier is legal here).
+        barrier();
+    } else {
+        wht_128(lane);
+    }
     store_dst_pair(out_stream, token, head, lane);
 }

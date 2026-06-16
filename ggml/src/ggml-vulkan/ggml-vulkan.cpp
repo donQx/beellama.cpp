@@ -1211,6 +1211,7 @@ struct vk_op_kvarn_materialize_push_constants {
     uint32_t bits;
     uint32_t value;
     uint32_t n_indices;
+    uint32_t emit_rotated;
 };
 static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128, "sizeof(vk_op_kvarn_materialize_push_constants) must be <= 128");
 
@@ -9199,6 +9200,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
     GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     const int n_total_stream = (int) (stage->ne[2] / 384);
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
@@ -9213,6 +9215,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t) bits,
         value ? 1u : 0u,
         (uint32_t) indices->ne[0],
+        emit_rotated ? 1u : 0u,
     };
 
     const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
