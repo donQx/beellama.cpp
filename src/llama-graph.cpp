@@ -634,6 +634,12 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         kvarn->set_input_kvarn_rot(self_kvarn_rot);
     }
 
+    if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
+        const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa());
+        GGML_ASSERT(kvarn_swa != nullptr);
+        kvarn_swa->set_input_kvarn_mat_idxs(self_kvarn_mat_idxs_swa);
+    }
+
     if (self_k_rot_swa) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
@@ -668,6 +674,13 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    // re-bind the SWA KVarN materialize indices to the (possibly new) SWA context
+    if (self_kvarn_mat_idxs_swa && self_kvarn_mat_idxs_swa->buffer) {
+        if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_swa())) {
+            const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(self_kvarn_mat_idxs_swa);
+        }
     }
 
     return res;
@@ -2660,8 +2673,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    // KVarN rotated-domain attention: available on both non-SWA (full-context) and
+    // SWA (sliding-window ring) layers when the cache is a KVarN cache, the rotation
+    // matrix input is present, Flash Attention is enabled, and the head dim is a
+    // multiple of 128 (the KVarN tile/Hadamard dimension). SWA KVarN layers carry their
+    // own per-cell position index for materialize; the KQ mask still enforces the window.
     const auto * kvarn_ctx =
-        (!is_swa && !kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
+        (!kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
             dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
     const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
@@ -2873,6 +2891,14 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+    if (!kvarn_force_materialize_enabled()) {
+        if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
+            inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
+            // make the materialize indices available to the context at graph build time
+            // (get_k/get_v/materialize run during build, before set_input populates them)
+            const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(inp->self_kvarn_mat_idxs_swa);
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

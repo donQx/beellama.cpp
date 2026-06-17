@@ -37,6 +37,12 @@ public:
     ggml_tensor * get_k_rotated(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_rotated(ggml_context * ctx, int32_t il) const;
 
+    // SWA sliding-window ring: per-cell absolute positions for materialize.
+    // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
+    ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
+    void set_input_kvarn_mat_idxs(ggml_tensor * dst) const;
+    void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
+
     ggml_tensor * get_turbo_rotation() const override;
     ggml_tensor * get_turbo_rotation_inv() const override;
     ggml_tensor * get_turbo_rot_forward() const override;
@@ -73,6 +79,7 @@ private:
 
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
     mutable std::unordered_map<int32_t, ggml_tensor *> stored_v;
+    mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for materialize
 };
 
 class llama_kv_cache_kvarn : public llama_memory_i {
@@ -128,6 +135,7 @@ public:
     int32_t mapped_layer_id(int32_t il) const;
     bool has_pending_stream_copies() const;
     bool apply_pending_stream_copies(llama_context * lctx);
+    bool is_swa() const { return swa; }
 
     ggml_tensor * store(
             ggml_context * ctx,
@@ -143,7 +151,8 @@ public:
             uint32_t n_kv,
             const llama_kv_cache::slot_info & sinfo,
             bool value,
-            bool emit_rotated = false) const;
+            bool emit_rotated = false,
+            ggml_tensor * mat_idxs = nullptr) const;
 
 private:
     struct layer {
@@ -171,6 +180,7 @@ private:
     const llama_kvarn_params params;
     const uint32_t n_stream;
     const uint32_t n_groups_per_stream;
+    const bool swa;
 
     std::unique_ptr<llama_kv_cache> metadata;
     std::vector<layer> layers;

@@ -539,6 +539,107 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_backend_free(backend);
 }
 
+// SWA sliding-window ring: write more tiles than the record ring holds so old
+// slots are reused, then materialize the live window. The two newest tiles come
+// from fp16 staging (near-lossless); the older in-window tiles come from records
+// whose ring slots were reused — a ring/seal bug would surface stale tiles and
+// blow up the error.
+static void test_cache_ops_swa(enum ggml_backend_dev_type device_type, bool required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    const int bits = 4;
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "swa: failed to init ctx");
+
+    constexpr int n_heads = 1;
+    constexpr int gps = 6;                 // 6 ring tiles (768 record capacity)
+    constexpr int n_tiles = 10;            // tiles 0..9 -> ring wraps (tile 6 reuses tile 0's slot)
+    constexpr int n_tokens = n_tiles * 128;
+    constexpr int window_base = 6 * 128;   // window covers tiles 6..9
+    constexpr int n_kv = 4 * 128;          // tiles 6,7 sealed (slots 0,1); tiles 8,9 live in staging
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * mat_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv); // per-cell absolute positions
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, gps);
+
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
+    stored->op_params[4] = 1; // SWA ring store
+    ggml_tensor * materialized = ggml_kvarn_materialize(ctx, records, stored, mat_indices, n_kv, 0, 1, bits, false);
+    materialized->op_params[6] = 1; // SWA ring materialize (per-cell positions)
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+    ggml_build_forward_expand(graph, materialized);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "swa: failed to allocate tensors");
+
+    std::vector<float> input(128 * n_heads * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int d = 0; d < 128; ++d) {
+            input[t * 128 + d] =
+                std::sin(float(d) * 0.071f) +
+                std::cos(float(t) * 0.0037f) +
+                float((d * 13 + t * 17) % 31 - 15) * 0.01f;
+        }
+    }
+    std::vector<int64_t> idx(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        idx[i] = i; // absolute token position
+    }
+    std::vector<int64_t> mat_idx(n_kv);
+    for (int cell = 0; cell < n_kv; ++cell) {
+        mat_idx[cell] = window_base + cell; // window covers tiles 6..9
+    }
+    std::vector<uint8_t> zeros(ggml_nbytes(stage) + ggml_nbytes(records), 0);
+
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(mat_indices, mat_idx.data(), 0, ggml_nbytes(mat_indices));
+    ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "swa: graph compute failed");
+
+    std::vector<ggml_fp16_t> output_f16(ggml_nelements(materialized));
+    std::vector<float> output(output_f16.size());
+    ggml_backend_tensor_get(materialized, output_f16.data(), 0, ggml_nbytes(materialized));
+    ggml_fp16_to_fp32_row(output_f16.data(), output.data(), output.size());
+
+    double sealed_error = 0.0; // tiles 6,7 -> reused ring slots 0,1
+    double live_error = 0.0;   // tiles 8,9 -> fp16 staging
+    for (int cell = 0; cell < n_kv; ++cell) {
+        const int abs_pos = window_base + cell;
+        for (int d = 0; d < 128; ++d) {
+            const double diff = double(input[abs_pos * 128 + d]) - double(output[cell * 128 + d]);
+            if (cell < 256) {
+                sealed_error += diff * diff;
+            } else {
+                live_error += diff * diff;
+            }
+        }
+    }
+    sealed_error = std::sqrt(sealed_error / (256 * 128));
+    live_error = std::sqrt(live_error / (256 * 128));
+    require(sealed_error < 0.25, "swa: sealed (wrapped) tile reconstruction error too high");
+    require(live_error < 0.02, "swa: live tail reconstruction error too high");
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 static std::vector<ggml_fp16_t> test_materialize_output(
         ggml_backend_t backend,
         int            bits,
@@ -848,6 +949,8 @@ int main() {
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_cache_ops_swa(GGML_BACKEND_DEVICE_TYPE_GPU, false); // CUDA SWA ring parity
     test_store_paths_gpu();
     test_materialize_paths_gpu();
     test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_CPU, true);

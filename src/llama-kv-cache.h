@@ -237,6 +237,9 @@ public:
     void set_input_k_rot_backend(ggml_tensor * dst) const;
     void set_input_v_rot_backend(ggml_tensor * dst) const;
 
+    // read-only access to the KV cell metadata for a given stream
+    const llama_kv_cells & get_cells(uint32_t stream) const { return v_cells[stream]; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

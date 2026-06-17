@@ -20,6 +20,8 @@ static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
 static constexpr int KVAR_N_OP_PARAM_VALUE = 2;
 static constexpr int KVAR_N_OP_PARAM_TOKENS_PER_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;     // store: SWA sliding-window ring mode
+static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;       // materialize: SWA ring (indices carry per-cell positions)
 
 enum class kvarn_prof_kind : uint8_t {
     STORE_HI = 0,
@@ -563,14 +565,18 @@ static __device__ void kvarn_quantize_stage(
         int bits,
         int iterations,
         bool value,
+        bool swa,
         float * shared) {
     float * tile = shared;
+    // SWA uses a 3-deep ping-pong over absolute tiles; non-SWA keeps tile 0 as a
+    // permanent sink and ping-pongs the two newest tiles in staging slots 1/2.
+    const int stage_slot = swa ? (stage_group % KVAR_N_STAGE_GROUPS) : (1 + ((stage_group - 1) & 1));
     for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
         const int row = i / KVAR_N_DIM;
         const int col = i % KVAR_N_DIM;
         const int token = value ? row : col;
         const int dim = value ? col : row;
-        const int stage_pos = stage_base + KVAR_N_DIM + ((stage_group - 1) & 1) * KVAR_N_DIM + token;
+        const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
         tile[i] = __half2float(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
     }
     __syncthreads();
@@ -805,6 +811,7 @@ static __global__ void kvarn_store_kernel_hishmem(
         int bits,
         int iterations,
         bool value,
+        bool swa,
         const int * skip_if_workspace_valid) {
     extern __shared__ float shared[];
     const int head = blockIdx.x;
@@ -815,24 +822,28 @@ static __global__ void kvarn_store_kernel_hishmem(
     for (int token = 0; token < n_tokens; ++token) {
         const int64_t idx = indices[token];
         const int group_global = (int) (idx / KVAR_N_DIM);
-        const int stream = group_global / groups_per_stream;
-        const int group = group_global - stream * groups_per_stream;
         const int pos = (int) (idx % KVAR_N_DIM);
-        if (stream < 0 || stream >= n_stream || group < 0 || group >= groups_per_stream) {
+        // SWA: idx is the absolute token position; records form a ring and there
+        // is no permanent group-0 sink (single stream).
+        const int stream = swa ? 0 : group_global / groups_per_stream;
+        const int group = swa ? group_global : group_global - stream * groups_per_stream;
+        if (stream < 0 || stream >= n_stream || group < 0 || (!swa && group >= groups_per_stream)) {
             return;
         }
 
         const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-        if (group > 2 && pos == 0) {
+        if (pos == 0 && (swa ? group >= 2 : group > 2)) {
             const int flush_group = group - 2;
-            const int flush_record_group = stream * groups_per_stream + flush_group;
+            const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
+            const int flush_record_group = stream * groups_per_stream + flush_ring;
             uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
-            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, shared);
+            kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, swa, shared);
         }
 
         shared[threadIdx.x] = current[(token * n_heads + head) * KVAR_N_DIM + threadIdx.x];
         kvarn_wht_128(shared);
-        const int stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + ((group - 1) & 1) * KVAR_N_DIM + pos);
+        const int stage_slot = swa ? (group % KVAR_N_STAGE_GROUPS) : (group == 0 ? 0 : 1 + ((group - 1) & 1));
+        const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         stage[(stage_pos * n_heads + head) * KVAR_N_DIM + threadIdx.x] =
             __float2half_rn(shared[threadIdx.x]);
         __syncthreads();
@@ -914,7 +925,7 @@ static __global__ void kvarn_store_direct_flush_kernel(
     const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
     const int flush_record_group = stream * groups_per_stream + flush_group;
     uint8_t * record = records + ((int64_t) flush_record_group * n_heads + head) * record_bytes;
-    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, shared);
+    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group, bits, iterations, value, /*swa=*/false, shared);
 }
 
 static __global__ void kvarn_store_direct_stage_kernel(
@@ -1211,6 +1222,7 @@ static __global__ void kvarn_live_groups_kernel(
         int stream_start,
         int n_stream,
         int groups_per_stream,
+        bool swa,
         int * live_groups) {
     const int out_stream = blockIdx.x;
     if (out_stream >= n_stream) {
@@ -1220,10 +1232,18 @@ static __global__ void kvarn_live_groups_kernel(
     const int stream = stream_start + out_stream;
     int live_group = 0;
     for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int group_global = (int) (indices[i] / KVAR_N_DIM);
-        const int idx_stream = group_global / groups_per_stream;
-        if (idx_stream == stream) {
-            live_group = max(live_group, group_global - stream * groups_per_stream);
+        const int64_t idx = indices[i];
+        if (swa) {
+            // SWA ring: indices carry absolute positions; idx < 0 marks empty cells
+            if (idx >= 0) {
+                live_group = max(live_group, (int) (idx / KVAR_N_DIM));
+            }
+        } else {
+            const int group_global = (int) (idx / KVAR_N_DIM);
+            const int idx_stream = group_global / groups_per_stream;
+            if (idx_stream == stream) {
+                live_group = max(live_group, group_global - stream * groups_per_stream);
+            }
         }
     }
 
@@ -1240,6 +1260,120 @@ static __global__ void kvarn_live_groups_kernel(
 
     if (threadIdx.x == 0) {
         live_groups[out_stream] = partial[0];
+    }
+}
+
+// SWA sliding-window ring materialize: a direct CUDA port of the CPU reference
+// (ggml/src/ggml-cpu/ops.cpp::ggml_compute_forward_kvarn_materialize, swa branch).
+// One thread block per (head, cell): the indices tensor carries one absolute
+// token position per output cell (idx < 0 marks an empty window cell). Records
+// are a circular buffer (slot = group % groups_per_stream); the two newest tiles
+// live in the 3-deep fp16 staging ping-pong; there is no permanent group-0 sink.
+// The SWA window is small, so the optimized fast/v4_pair kernels are not needed.
+template<int BITS, bool VALUE, bool EMIT_ROTATED>
+static __global__ void kvarn_materialize_swa_kernel(
+        const uint8_t * records,
+        const half * stage,
+        const int * live_groups,
+        const int64_t * indices,
+        half * dst,
+        int n_heads,
+        int n_kv,
+        int groups_per_stream,
+        int record_bytes) {
+    const int head = blockIdx.x;
+    const int cell = blockIdx.y;
+    const int dim = threadIdx.x;
+    const int64_t abs_pos = indices[cell];
+    const int live_group = live_groups[0];
+    const int stage_base = 0; // SWA: single stream
+
+    if (abs_pos < 0) {
+        // empty window cell - write zero
+        half * out = dst + ((int64_t) cell * n_heads + head) * KVAR_N_DIM;
+        out[dim] = __float2half_rn(0.0f);
+        return;
+    }
+
+    const int group = (int) (abs_pos / KVAR_N_DIM);
+    const int pos = (int) (abs_pos % KVAR_N_DIM);
+
+    const bool from_stage  = group >= live_group - 1 && group <= live_group;
+    const bool from_record = !from_stage && group >= 0 && group < live_group - 1 &&
+                             (live_group - group) < groups_per_stream;
+
+    float rotated = 0.0f;
+    if (from_stage) {
+        const int stage_slot = group % KVAR_N_STAGE_GROUPS;
+        const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
+        const half * src = stage + ((int64_t) stage_pos * n_heads + head) * KVAR_N_DIM;
+        rotated = __half2float(src[dim]);
+    } else if (from_record) {
+        const int record_group = (group % groups_per_stream);
+        const uint8_t * record = records + ((int64_t) record_group * n_heads + head) * record_bytes;
+        constexpr int payload_bytes = KVAR_N_TILE_VALUES * BITS / 8;
+        const half * scale_axis  = (const half *) (record + payload_bytes);
+        const half * zp_axis     = scale_axis + KVAR_N_DIM;
+        const half * other_axis  = zp_axis + KVAR_N_DIM;
+        const int row = VALUE ? pos : dim;
+        const int col = VALUE ? dim : pos;
+        const float scale = __half2float(scale_axis[row]);
+        const float zp    = __half2float(zp_axis[row]);
+        const float other = __half2float(other_axis[col]);
+        const int bit_offset = (row * KVAR_N_DIM + col) * BITS;
+        const int byte_offset = bit_offset >> 3;
+        const int bit_in_byte = bit_offset & 7;
+        const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
+        const uint16_t mask = (uint16_t) ((1u << BITS) - 1u);
+        const uint8_t q = (packed >> bit_in_byte) & mask;
+        rotated = (float(q) * scale + zp) * other;
+    }
+
+    if (EMIT_ROTATED) {
+        half * out = dst + ((int64_t) cell * n_heads + head) * KVAR_N_DIM;
+        out[dim] = __float2half_rn(rotated);
+        return;
+    }
+
+    // inverse WHT (128-dim) via shared-memory butterfly; mirrors kvarn_wht_128
+    __shared__ float sh[KVAR_N_DIM];
+    sh[dim] = rotated;
+    __syncthreads();
+    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
+        const int j = (dim / stride) * (2 * stride) + (dim % stride);
+        const float a = sh[j];
+        const float b = sh[j + stride];
+        sh[j] = a + b;
+        sh[j + stride] = a - b;
+        __syncthreads();
+    }
+    const float out_val = sh[dim] * 0.08838834764831845f;
+    half * out = dst + ((int64_t) cell * n_heads + head) * KVAR_N_DIM;
+    out[dim] = __float2half_rn(out_val);
+}
+
+template<int BITS, bool VALUE>
+static void kvarn_launch_materialize_swa(
+        const uint8_t * records,
+        const half * stage,
+        const int * live_groups,
+        const int64_t * indices,
+        half * dst,
+        int n_heads,
+        int n_kv,
+        int groups_per_stream,
+        int record_bytes,
+        bool emit_rotated,
+        cudaStream_t stream) {
+    dim3 blocks((uint32_t) n_heads, (uint32_t) n_kv, 1);
+    if (emit_rotated) {
+        kvarn_materialize_swa_kernel<BITS, VALUE, true><<<blocks, KVAR_N_DIM, 0, stream>>>(
+            records, stage, live_groups, indices, dst,
+            n_heads, n_kv, groups_per_stream, record_bytes);
+    } else {
+        kvarn_materialize_swa_kernel<BITS, VALUE, false><<<blocks, KVAR_N_DIM, 0, stream>>>(
+            records, stage, live_groups, indices, dst,
+            n_heads, n_kv, groups_per_stream, record_bytes);
     }
 }
 
@@ -1720,11 +1854,15 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int iterations = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_ITERS);
     const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_VALUE) != 0;
     const int tokens_per_stream_hint = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TOKENS_PER_STREAM);
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_SWA) != 0;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
+    if (swa) {
+        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
+    }
     const size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
     cudaStream_t stream = ctx.stream();
     const int n_heads = (int) current->ne[1];
@@ -1732,6 +1870,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const size_t staged_bytes = (size_t) current->ne[0] * (size_t) current->ne[1] * (size_t) current->ne[2] * sizeof(half);
 
     const bool hint_well_formed =
+        !swa &&
         tokens_per_stream_hint > 0 &&
         tokens_per_stream_hint <= n_tokens &&
         n_tokens % tokens_per_stream_hint == 0;
@@ -1831,6 +1970,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value,
+            /*swa=*/false,
             workspace_valid.get());
         kvarn_prof_end(prof, stream);
         return;
@@ -1903,9 +2043,11 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             bits,
             iterations,
             value,
+            swa,
             nullptr);
         kvarn_prof_end(prof, stream);
     } else {
+        GGML_ASSERT(!swa && "SWA KVarN ring requires a backend with >= KVAR_N_SHARED_BYTES shared memory");
         GGML_ASSERT(smpbo >= KVAR_N_LOWSHMEM_BYTES);
         auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_LOW, value, bits, (int) current->ne[2], staged_bytes);
         kvarn_store_kernel_lowshmem<<<n_heads, KVAR_N_DIM, KVAR_N_LOWSHMEM_BYTES, stream>>>(
@@ -1939,6 +2081,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
     const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
@@ -1956,8 +2099,65 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
         stream_start,
         n_stream,
         groups_per_stream,
+        swa,
         live_groups.get());
     kvarn_prof_end(prof_live, stream);
+
+    if (swa) {
+        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring materialize requires a single stream");
+        auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
+        const int n_heads = (int) dst->ne[1];
+        const int n_kv    = (int) dst->ne[2];
+        const int record_bytes = (int) records->ne[0];
+        switch (bits) {
+            case 2:
+                if (value) {
+                    kvarn_launch_materialize_swa<2, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<2, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            case 3:
+                if (value) {
+                    kvarn_launch_materialize_swa<3, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<3, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            case 4:
+                if (value) {
+                    kvarn_launch_materialize_swa<4, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<4, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            case 5:
+                if (value) {
+                    kvarn_launch_materialize_swa<5, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<5, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            case 6:
+                if (value) {
+                    kvarn_launch_materialize_swa<6, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<6, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            case 8:
+                if (value) {
+                    kvarn_launch_materialize_swa<8, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                } else {
+                    kvarn_launch_materialize_swa<8, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (const int64_t *) indices->data, (half *) dst->data, n_heads, n_kv, groups_per_stream, record_bytes, emit_rotated, stream);
+                }
+                break;
+            default:
+                GGML_ABORT("kvarn: no SWA materialize kernel for bits %d", bits);
+        }
+        kvarn_prof_end(prof_mat, stream);
+        return;
+    }
 
     auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
     switch (bits) {

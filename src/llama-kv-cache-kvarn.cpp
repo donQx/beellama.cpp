@@ -196,25 +196,25 @@ ggml_type llama_kv_cache_kvarn_context::type_v() const {
 ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_rotated(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, true);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_rotated(ggml_context * ctx, int32_t il) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, true);
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rotation() const {
@@ -276,19 +276,86 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context *
     return res;
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
+    // SWA ring materialize: one absolute token position per output cache cell.
+    // Sized to the padded n_kv so the graph is reusable across batches; empty
+    // window cells are marked with idx < 0 and produce zero output.
+    const uint32_t n_kv = get_n_kv();
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kvarn_mat_idxs_swa");
+    return res;
+}
+
+void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I64);
+
+    const auto * kv = cache->get_metadata_cache();
+    const uint32_t n_kv = (uint32_t) dst->ne[0];
+    int64_t * data = (int64_t *) dst->data;
+
+    // single stream for SWA ring
+    const auto & cells = kv->get_cells(0);
+    for (uint32_t cell = 0; cell < n_kv; ++cell) {
+        if (cells.is_empty(cell)) {
+            data[cell] = -1; // empty window cell
+        } else {
+            data[cell] = (int64_t) cells.pos_get(cell);
+        }
+    }
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->is_swa()) {
+        // SWA ring store: indices carry absolute token positions (one per input token).
+        // The store op decodes group = idx/128, pos = idx%128 and maps the group into a
+        // ring slot. The metadata cache's own cell ordering is irrelevant to the records.
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        int64_t * data = (int64_t *) dst->data;
+        const uint32_t n_tokens = ubatch->n_tokens;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
+        }
+        return;
+    }
     base()->set_input_k_idxs(dst, ubatch);
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->is_swa()) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        int64_t * data = (int64_t *) dst->data;
+        const uint32_t n_tokens = ubatch->n_tokens;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
+        }
+        return;
+    }
     base()->set_input_v_idxs(dst, ubatch);
 }
 
 void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->is_swa()) {
+        std::vector<int64_t> data(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
+        }
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
+        return;
+    }
     base()->set_input_k_idxs_backend(dst, ubatch);
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->is_swa()) {
+        std::vector<int64_t> data(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
+        }
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
+        return;
+    }
     base()->set_input_v_idxs_backend(dst, ubatch);
 }
 
@@ -348,6 +415,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     params(params),
     n_stream(unified ? 1u : n_seq_max),
     n_groups_per_stream((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP),
+    swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -366,7 +434,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         nullptr,
         nullptr)) {
     GGML_ASSERT(n_stream > 0);
-    GGML_ASSERT(kv_size % KVAR_N_GROUP == 0);
+    GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
+    if (swa) {
+        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a unified (single-stream) cache");
+    }
 
     struct buft_comparator {
         bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
@@ -619,6 +690,12 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         return p0 <= 0 && p1 < 0;
     }
 
+    if (swa) {
+        // SWA ring: eviction is implicit (ring overwrite). The metadata cache
+        // already enforces the SWA window, so defer all removal decisions to it.
+        return true;
+    }
+
     const llama_pos pos_max = metadata->seq_pos_max(seq_id);
     return llama_kvarn_can_remove_range(pos_max, p0, p1, KVAR_N_GROUP);
 }
@@ -636,6 +713,10 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    if (swa) {
+        // SWA ring: the metadata cache manages window eviction; records follow the ring.
+        return metadata->seq_rm_cell(seq_id, cell_idx);
+    }
     const llama_pos pos_max = metadata->seq_pos_max(seq_id);
     if (pos_max >= 0) {
         const uint32_t earliest_exact = uint32_t(std::max<llama_pos>(0, pos_max / KVAR_N_GROUP - 1) * KVAR_N_GROUP);
@@ -787,7 +868,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     // If multi-stream partial writes are ever added, n_groups_used must become
     // per-stream.
     uint32_t n_groups_used = n_groups_per_stream;
-    if (seq_id >= 0) {
+    if (seq_id >= 0 && !swa) {
         const llama_pos pos_max = metadata->seq_pos_max(seq_id);
         if (pos_max >= 0) {
             // ceil((pos_max + 1) / KVAR_N_GROUP) — covers all groups that the
@@ -797,6 +878,8 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             n_groups_used = std::min(n_groups_per_stream, (uint32_t) ((pos_max + KVAR_N_GROUP) / KVAR_N_GROUP));
         }
     }
+    // SWA ring: always serialize all ring slots — the live window may wrap around
+    // and occupy any slot, so partial serialization by group index is not meaningful.
     io.write(&n_groups_used, sizeof(n_groups_used));
 
     for (const auto & layer : layers) {
@@ -975,6 +1058,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         params.sinkhorn_iters,
         value);
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
+    result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     return result;
 }
 
@@ -985,22 +1069,28 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
         bool value,
-        bool emit_rotated) const {
+        bool emit_rotated,
+        ggml_tensor * mat_idxs) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
+
+    // SWA ring materialize consumes per-cell absolute positions (mat_idxs);
+    // the non-SWA path consumes the store indices (stored->src[1]) unchanged.
+    ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
 
     ggml_tensor * result = ggml_kvarn_materialize(
         ctx,
         value ? layer.v_records : layer.k_records,
         stored,
-        stored->src[1],
+        indices,
         n_kv,
         stream_start,
         stream_count,
         value ? params.value_bits : params.key_bits,
         value);
     result->op_params[5] = emit_rotated ? 1 : 0;
+    result->op_params[6] = swa ? 1 : 0; // SWA sliding-window ring materialize
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(
